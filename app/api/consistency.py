@@ -1,10 +1,10 @@
 from fastapi import APIRouter, HTTPException
 
-from app.modules.consistency.schemas import (
+from app.services.consistency.schemas import (
     ConsistencyAnalyzeRequest,
     ConsistencyAnalyzeResponse,
 )
-from app.modules.consistency.service import ConsistencyService
+from app.services.consistency.service import ConsistencyService
 
 router = APIRouter()
 consistency_service = ConsistencyService()

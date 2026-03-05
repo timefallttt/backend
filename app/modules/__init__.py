@@ -1,2 +1,0 @@
-"""Application feature modules."""
-
