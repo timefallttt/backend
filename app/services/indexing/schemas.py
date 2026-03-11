@@ -14,6 +14,7 @@ ParserMode = Literal["arkanalyzer", "placeholder"]
 GraphStoreStatus = Literal["loaded", "pending_setup", "failed", "not_attempted"]
 NodeType = Literal["Repository", "File", "Class", "Function"]
 EdgeType = Literal["CONTAINS", "CALLS"]
+GraphQuerySource = Literal["neo4j", "artifact"]
 
 
 class RepositoryIndexRequest(BaseModel):
@@ -87,3 +88,55 @@ class IndexJobDetail(BaseModel):
 class IndexJobListResponse(BaseModel):
     jobs: List[IndexJobSummary] = Field(default_factory=list)
 
+
+class GraphSeedQuery(BaseModel):
+    node_id: str = ""
+    name: str = ""
+    path: str = ""
+    signature: str = ""
+    max_matches: int = Field(5, ge=1, le=20)
+
+
+class GraphEvidenceQueryRequest(BaseModel):
+    seeds: List[GraphSeedQuery] = Field(default_factory=list)
+    max_hops: int = Field(2, ge=1, le=3)
+    max_paths: int = Field(20, ge=1, le=100)
+    edge_types: List[EdgeType] = Field(default_factory=lambda: ["CALLS", "CONTAINS"])
+
+
+class GraphSeedMatch(BaseModel):
+    seed: GraphSeedQuery
+    matched_nodes: List[GraphNode] = Field(default_factory=list)
+
+
+class GraphPathStep(BaseModel):
+    node_id: str
+    node_type: NodeType
+    name: str
+    path: str = ""
+    relation_from_prev: EdgeType | None = None
+
+
+class GraphEvidencePath(BaseModel):
+    path_id: str
+    hop_count: int = Field(..., ge=0)
+    nodes: List[GraphPathStep] = Field(default_factory=list)
+
+
+class GraphEvidenceSummary(BaseModel):
+    matched_seed_count: int = 0
+    expanded_node_count: int = 0
+    expanded_edge_count: int = 0
+    evidence_path_count: int = 0
+
+
+class GraphEvidenceQueryResponse(BaseModel):
+    job_id: str
+    snapshot_id: str
+    source: GraphQuerySource
+    seed_matches: List[GraphSeedMatch] = Field(default_factory=list)
+    nodes: List[GraphNode] = Field(default_factory=list)
+    edges: List[GraphEdge] = Field(default_factory=list)
+    paths: List[GraphEvidencePath] = Field(default_factory=list)
+    summary: GraphEvidenceSummary = Field(default_factory=GraphEvidenceSummary)
+    hints: List[str] = Field(default_factory=list)
