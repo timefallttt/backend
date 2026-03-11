@@ -17,5 +17,5 @@ ARKANALYZER_TIMEOUT_SEC = int(os.getenv("ARKANALYZER_TIMEOUT_SEC", "1800"))
 
 NEO4J_URI = os.getenv("NEO4J_URI", "bolt://localhost:7687").strip()
 NEO4J_USERNAME = os.getenv("NEO4J_USERNAME", "neo4j").strip()
-NEO4J_PASSWORD = os.getenv("NEO4J_PASSWORD", "neo4j").strip()
+NEO4J_PASSWORD = os.getenv("NEO4J_PASSWORD", "12345678").strip()
 NEO4J_DATABASE = os.getenv("NEO4J_DATABASE", "neo4j").strip()
