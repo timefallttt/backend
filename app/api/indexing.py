@@ -1,5 +1,6 @@
-from fastapi import APIRouter, BackgroundTasks, HTTPException
+﻿from fastapi import APIRouter, BackgroundTasks, HTTPException
 
+from app.services.indexing.runtime import graph_query_service, indexing_service
 from app.services.indexing.schemas import (
     GraphEvidenceQueryRequest,
     GraphEvidenceQueryResponse,
@@ -7,12 +8,8 @@ from app.services.indexing.schemas import (
     IndexJobListResponse,
     RepositoryIndexRequest,
 )
-from app.services.indexing.query_service import GraphQueryService
-from app.services.indexing.service import OfflineIndexingService
 
 router = APIRouter()
-indexing_service = OfflineIndexingService()
-graph_query_service = GraphQueryService()
 
 
 @router.get("/jobs", response_model=IndexJobListResponse)

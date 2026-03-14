@@ -1,5 +1,6 @@
-from fastapi import APIRouter, HTTPException
+﻿from fastapi import APIRouter, HTTPException
 
+from app.services.consistency.runtime import consistency_service
 from app.services.consistency.schemas import (
     ConsistencyAnalyzeRequest,
     ConsistencyAnalyzeResponse,
@@ -10,10 +11,8 @@ from app.services.consistency.schemas import (
     ReviewTaskDetail,
     ReviewTaskListResponse,
 )
-from app.services.consistency.service import ConsistencyService
 
 router = APIRouter()
-consistency_service = ConsistencyService()
 
 
 @router.get("/dashboard", response_model=ReviewDashboardResponse)
@@ -88,4 +87,3 @@ async def analyze_requirement_consistency(
         return consistency_service.analyze(request)
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
-
