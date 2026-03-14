@@ -16,9 +16,11 @@ from app.services.indexing.schemas import GraphEvidenceQueryRequest, GraphSeedQu
 from app.services.indexing.service import OfflineIndexingService
 from app.services.workitems.connectors.demo import DemoWorkItemConnector
 from app.services.workitems.schemas import (
+    WorkItemCodeSeed,
     WorkItemConnectorListResponse,
     WorkItemConnectorSummary,
     WorkItemDetail,
+    WorkItemDiffHunk,
     WorkItemImportRequest,
     WorkItemListResponse,
     WorkItemSummary,
@@ -62,7 +64,14 @@ class WorkItemService:
 
     def get_item(self, connector_key: str, item_id: str) -> WorkItemDetail:
         connector = self._get_connector(connector_key)
-        return connector.get_item(item_id)
+        item = connector.get_item(item_id)
+        derived_seeds = self._derive_seed_previews(item)
+        return item.model_copy(
+            update={
+                'derived_seeds': derived_seeds,
+                'derived_seed_count': len(derived_seeds),
+            }
+        )
 
     def import_item(self, request: WorkItemImportRequest) -> ReviewTaskDetail:
         item = self.get_item(request.connector_key, request.item_id)
@@ -110,12 +119,43 @@ class WorkItemService:
                 code=seed.code,
                 start_line=seed.start_line,
                 end_line=seed.end_line,
-                recall_reason=seed.recall_reason or 'Imported from work item',
+                recall_reason=seed.recall_reason or 'Imported from work item diff',
                 source=seed.source,
                 selected=True,
             )
-            for seed in item.candidate_seeds
+            for seed in item.derived_seeds
         ]
+
+    def _derive_seed_previews(self, item: WorkItemDetail) -> List[WorkItemCodeSeed]:
+        seeds: List[WorkItemCodeSeed] = []
+        for commit in item.linked_commits:
+            short_hash = commit.commit_hash[:8] if commit.commit_hash else commit.commit_id
+            for file_diff in commit.file_diffs:
+                relevant_hunks = [hunk for hunk in file_diff.hunks if hunk.added_lines or hunk.context_lines]
+                if not relevant_hunks:
+                    continue
+                for index, hunk in enumerate(relevant_hunks, start=1):
+                    snippet_lines = self._build_snippet_lines(hunk)
+                    if not snippet_lines:
+                        continue
+                    seeds.append(
+                        WorkItemCodeSeed(
+                            seed_id=f'{commit.commit_id}-{file_diff.diff_id}-{index}',
+                            filename=file_diff.filename,
+                            code='\n'.join(snippet_lines),
+                            start_line=hunk.start_line,
+                            end_line=max(hunk.end_line, hunk.start_line + len(snippet_lines) - 1),
+                            recall_reason=f'由 commit {short_hash} 的 diff 片段派生',
+                            source='workitem_diff',
+                        )
+                    )
+        return seeds
+
+    def _build_snippet_lines(self, hunk: WorkItemDiffHunk) -> List[str]:
+        added = [line for line in hunk.added_lines if line.strip()]
+        if added:
+            return added[:12]
+        return [line for line in hunk.context_lines if line.strip()][:12]
 
     def _expand_graph_evidence(
         self,
@@ -174,3 +214,4 @@ class WorkItemService:
             return match.group(1)
         filename = snippet.filename.replace('\\', '/').split('/')[-1]
         return filename.rsplit('.', 1)[0]
+
