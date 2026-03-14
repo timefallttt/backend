@@ -1,4 +1,4 @@
-﻿from fastapi import APIRouter, HTTPException
+﻿from fastapi import APIRouter, HTTPException, Response
 
 from app.services.consistency.runtime import consistency_service
 from app.services.consistency.schemas import (
@@ -43,6 +43,17 @@ async def create_review_task(request: ReviewTaskCreateRequest) -> ReviewTaskDeta
 async def get_review_task(task_id: str) -> ReviewTaskDetail:
     try:
         return consistency_service.get_task(task_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
+@router.delete("/tasks/{task_id}", status_code=204)
+async def delete_review_task(task_id: str) -> Response:
+    try:
+        consistency_service.delete_task(task_id)
+        return Response(status_code=204)
     except ValueError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     except Exception as exc:

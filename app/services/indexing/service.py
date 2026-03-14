@@ -1,6 +1,7 @@
 import hashlib
 import json
 import re
+import shutil
 import threading
 from datetime import datetime
 from pathlib import Path
@@ -151,6 +152,24 @@ class OfflineIndexingService:
                 self._save_jobs()
 
         return self._build_detail(job)
+
+    def delete_job(self, job_id: str) -> None:
+        with self._lock:
+            job = self._get_job_or_raise(job_id)
+            snapshot = RepoSnapshot(**job["snapshot"])
+            snapshot_id = f"{snapshot.repo_name}@{snapshot.commit_hash or snapshot.branch}"
+            artifact_dir = Path(job["artifact_dir"])
+            repo_dir = Path(snapshot.local_path) if snapshot.local_path else None
+
+            self._graph_store.delete_snapshot(snapshot_id)
+            del self._jobs[job_id]
+            self._save_jobs()
+
+        if artifact_dir.exists():
+            shutil.rmtree(artifact_dir, ignore_errors=True)
+
+        if repo_dir and repo_dir.exists() and not self._is_repo_path_referenced(str(repo_dir)):
+            shutil.rmtree(repo_dir, ignore_errors=True)
 
     def _run_parser(
         self,
@@ -468,6 +487,12 @@ class OfflineIndexingService:
     def _append_log(self, job: dict, message: str) -> None:
         timestamp = self._now()
         job["logs"].append(f"[{timestamp}] {message}")
+
+    def _is_repo_path_referenced(self, repo_path: str) -> bool:
+        return any(
+            item.get("snapshot", {}).get("local_path") == repo_path
+            for item in self._jobs.values()
+        )
 
     def _build_summary(self, job: dict) -> IndexJobSummary:
         return IndexJobSummary(

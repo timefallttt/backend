@@ -1,4 +1,4 @@
-﻿from fastapi import APIRouter, BackgroundTasks, HTTPException
+﻿from fastapi import APIRouter, BackgroundTasks, HTTPException, Response
 
 from app.services.indexing.runtime import graph_query_service, indexing_service
 from app.services.indexing.schemas import (
@@ -48,6 +48,17 @@ async def create_index_job(
 async def run_index_job(job_id: str) -> IndexJobDetail:
     try:
         return indexing_service.run_job(job_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
+@router.delete("/jobs/{job_id}", status_code=204)
+async def delete_index_job(job_id: str) -> Response:
+    try:
+        indexing_service.delete_job(job_id)
+        return Response(status_code=204)
     except ValueError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     except Exception as exc:

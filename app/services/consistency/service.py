@@ -75,6 +75,12 @@ class ConsistencyService:
         task = self._get_task_or_raise(task_id)
         return self._build_task_detail(task)
 
+    def delete_task(self, task_id: str) -> None:
+        with self._lock:
+            self._get_task_or_raise(task_id)
+            del self._tasks[task_id]
+            self._save_tasks()
+
     def create_task(self, request: ReviewTaskCreateRequest) -> ReviewTaskDetail:
         now = self._now()
         task_id = f'task-{uuid4().hex[:8]}'

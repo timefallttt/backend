@@ -132,6 +132,38 @@ class Neo4jGraphStore:
         finally:
             driver.close()
 
+    def delete_snapshot(self, snapshot_id: str) -> tuple[bool, list[str]]:
+        if not self.is_configured():
+            return False, []
+
+        try:
+            driver = self._create_driver()
+        except ModuleNotFoundError:
+            return False, []
+
+        try:
+            with driver.session(database=NEO4J_DATABASE) as session:
+                session.run(
+                    """
+                    MATCH (snap:RepositorySnapshot {snapshot_id: $snapshot_id})
+                    OPTIONAL MATCH (snap)-[c:CONTAINS]->(n:CodeNode)
+                    DELETE c
+                    WITH snap, collect(DISTINCT n) AS nodes
+                    DETACH DELETE snap
+                    UNWIND nodes AS node
+                    WITH DISTINCT node
+                    WHERE node IS NOT NULL AND NOT ()-[:CONTAINS]->(node)
+                    DETACH DELETE node
+                    """,
+                    snapshot_id=snapshot_id,
+                )
+        except Exception as exc:
+            return False, [f"Neo4j 清理失败：{exc}"]
+        finally:
+            driver.close()
+
+        return True, []
+
     def _create_driver(self):
         from neo4j import GraphDatabase
 
@@ -198,5 +230,7 @@ class Neo4jGraphStore:
 
     def _edge_key(self, edge: GraphEdge) -> str:
         return f"{edge.edge_type}:{edge.source_id}:{edge.target_id}:{edge.detail}"
+
+
 def write_graph_artifact_file(graph_path: Path, artifact: GraphArtifact) -> None:
     graph_path.write_text(artifact.model_dump_json(indent=2), encoding="utf-8")
