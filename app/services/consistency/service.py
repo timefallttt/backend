@@ -1,6 +1,5 @@
 import re
 from collections import Counter
-from copy import deepcopy
 from datetime import datetime
 from typing import Dict, Iterable, List
 from uuid import uuid4
@@ -13,6 +12,8 @@ from .schemas import (
     EvidencePath,
     EvidencePathNode,
     EvidenceRef,
+    GraphEvidenceBundle,
+    GraphEvidenceStepInput,
     ItemJudgement,
     RequirementSpec,
     ReviewDashboardResponse,
@@ -65,6 +66,7 @@ class ConsistencyService:
                 requirement_text=request.requirement_text,
                 acceptance_criteria=request.acceptance_criteria,
                 candidate_snippets=request.candidate_snippets,
+                graph_evidence=request.graph_evidence,
                 options=request.options,
             )
         )
@@ -81,6 +83,7 @@ class ConsistencyService:
             "owner": request.owner,
             "notes": request.notes,
             "candidate_snippets": [snippet.model_dump() for snippet in request.candidate_snippets],
+            "graph_evidence": request.graph_evidence.model_dump() if request.graph_evidence else None,
             "options": request.options.model_dump(),
             "report": report.model_dump(),
             "feedback_entries": [],
@@ -106,6 +109,7 @@ class ConsistencyService:
             requirement_text=task["requirement_text"],
             acceptance_criteria=task["acceptance_criteria"],
             candidate_snippets=[CandidateSnippet(**snippet) for snippet in task["candidate_snippets"]],
+            graph_evidence=GraphEvidenceBundle(**task["graph_evidence"]) if task.get("graph_evidence") else None,
             options=AnalyzeOptions(**task["options"]),
         )
         report = self.analyze(request)
@@ -119,7 +123,7 @@ class ConsistencyService:
                 "status": report.status,
                 "overall_score": report.overall_score,
                 "summary": report.summary,
-                "changed_points": ["基于当前候选代码重新生成示例报告"],
+                "changed_points": ["基于当前种子代码和图证据重新生成审阅报告"],
                 "created_at": task["updated_at"],
             },
         )
@@ -151,7 +155,7 @@ class ConsistencyService:
                 "status": self._task_status(task),
                 "overall_score": self._task_score(task),
                 "summary": f"人工复核：{request.judgement_item}",
-                "changed_points": [f"{request.reviewer} 将结果标记为 {request.decision}"],
+                "changed_points": [f"{request.reviewer} 将结论标记为 {request.decision}"],
                 "created_at": feedback.created_at,
             },
         )
@@ -203,10 +207,18 @@ class ConsistencyService:
         overall_score = round(sum(item.score for item in judgements) / len(judgements), 3)
         overall_confidence = round(sum(item.confidence for item in judgements) / len(judgements), 3)
         missing_items = [item.item for item in judgements if item.status == "not_satisfied"]
-        tool_findings = self._build_tool_findings(request.options.enable_tool_evidence, judgements)
-        evidence_paths = self._build_evidence_paths(request.requirement_text, requirement_items, selected_snippets)
-        structural_gaps = self._build_structural_gaps(judgements, evidence_paths)
-        review_focuses = self._build_review_focuses(selected_snippets, missing_items)
+        evidence_paths = self._resolve_evidence_paths(
+            request.graph_evidence,
+            request.requirement_text,
+            requirement_items,
+            selected_snippets,
+        )
+        if request.graph_evidence and request.graph_evidence.summary.matched_seed_count:
+            overall_confidence = round(min(0.98, overall_confidence + 0.08), 3)
+
+        tool_findings = self._build_tool_findings(request.options.enable_tool_evidence, judgements, request.graph_evidence)
+        structural_gaps = self._build_structural_gaps(judgements, evidence_paths, request.graph_evidence)
+        review_focuses = self._build_review_focuses(selected_snippets, missing_items, request.graph_evidence)
         status = "needs_review" if overall_confidence < 0.6 or missing_items else "completed"
         summary = self._build_summary(overall_score, overall_confidence, judgements, missing_items)
 
@@ -272,7 +284,7 @@ class ConsistencyService:
                         filename=snippet.filename,
                         start_line=snippet.start_line,
                         end_line=snippet.end_line,
-                        reason=f"关键词命中: {matched}",
+                        reason=f"关键词命中：{matched}",
                     )
                 )
         return evidences
@@ -291,36 +303,23 @@ class ConsistencyService:
 
     def _to_status_payload(self, match_ratio: float, evidence_count: int) -> tuple[str, float, float, str]:
         if evidence_count == 0:
-            return "not_satisfied", 0.0, 0.35, "未检索到支持该要点的直接代码证据，建议沿图关系继续补充证据。"
+            return "not_satisfied", 0.0, 0.35, "未检索到支持该要点的直接代码证据，建议结合图扩展继续补充。"
         if match_ratio >= 0.6:
             return "satisfied", 1.0, min(0.95, 0.6 + evidence_count * 0.05), "当前候选代码与扩展关系可以支撑该要点。"
         return "partially_satisfied", 0.5, min(0.8, 0.45 + evidence_count * 0.05), "已有部分证据，但仍需补充异常路径或约束校验节点。"
 
-    def _build_tool_findings(self, enabled: bool, judgements: Iterable[ItemJudgement]) -> List[ToolFinding]:
-        if not enabled:
-            return []
+    def _resolve_evidence_paths(
+        self,
+        graph_evidence: GraphEvidenceBundle | None,
+        requirement_text: str,
+        requirement_items: List[str],
+        snippets: List[CandidateSnippet],
+    ) -> List[EvidencePath]:
+        if graph_evidence and graph_evidence.paths:
+            return self._build_graph_evidence_paths(graph_evidence, requirement_items)
+        return self._build_placeholder_paths(requirement_text, requirement_items, snippets)
 
-        findings: List[ToolFinding] = []
-        for item in judgements:
-            if item.status == "not_satisfied":
-                findings.append(
-                    ToolFinding(
-                        level="warning",
-                        message="建议对该要点补充 lint、typecheck 或规则检查结果。",
-                        related_item=item.item,
-                    )
-                )
-            elif item.status == "partially_satisfied":
-                findings.append(
-                    ToolFinding(
-                        level="info",
-                        message="建议人工确认图扩展出的关键调用链是否完整。",
-                        related_item=item.item,
-                    )
-                )
-        return findings
-
-    def _build_evidence_paths(
+    def _build_placeholder_paths(
         self,
         requirement_text: str,
         requirement_items: List[str],
@@ -335,7 +334,7 @@ class ConsistencyService:
                 EvidencePath(
                     path_id=f"path-{index + 1}",
                     title=f"证据路径 {index + 1}",
-                    summary=f"从候选种子 {filename} 出发，扩展到关键实现节点以支撑要点“{first_item}”。",
+                    summary=f"从候选种子 {filename} 出发，扩展到关键实现节点以支持要点“{first_item}”。",
                     supports_items=[first_item],
                     nodes=[
                         EvidencePathNode(
@@ -358,42 +357,132 @@ class ConsistencyService:
                             relation_from_prev="CONTAINS",
                             detail="由文件节点扩展出的关键函数",
                         ),
-                        EvidencePathNode(
-                            node_id=f"service-{index + 1}",
-                            label="扩展服务节点",
-                            node_type="service",
-                            relation_from_prev="CALLS",
-                            detail="示例化的图扩展结果，用于展示后续真实调用链位置",
-                        ),
                     ],
                 )
             )
-        if not paths:
+        if paths:
+            return paths
+        return [
+            EvidencePath(
+                path_id="path-empty",
+                title="证据路径占位",
+                summary="当前未导入候选代码，系统未能构造示例证据路径。",
+                supports_items=[],
+                nodes=[],
+            )
+        ]
+
+    def _build_graph_evidence_paths(
+        self,
+        graph_evidence: GraphEvidenceBundle,
+        requirement_items: List[str],
+    ) -> List[EvidencePath]:
+        paths: List[EvidencePath] = []
+        for index, path in enumerate(graph_evidence.paths):
+            supports_items = []
+            if requirement_items:
+                supports_items = [requirement_items[index % len(requirement_items)]]
+            nodes = [self._to_evidence_path_node(node) for node in path.nodes]
+            if not nodes:
+                continue
+            preview = " -> ".join(node.label for node in nodes[:3])
             paths.append(
                 EvidencePath(
-                    path_id="path-empty",
-                    title="证据路径占位",
-                    summary="当前未导入候选代码，系统未能构造示例证据路径。",
-                    supports_items=[],
-                    nodes=[],
+                    path_id=path.path_id,
+                    title=f"图证据路径 {index + 1}",
+                    summary=f"基于 {graph_evidence.source} 扩展得到的 {path.hop_count} 跳路径：{preview}",
+                    supports_items=supports_items,
+                    nodes=nodes,
                 )
             )
-        return paths
+        return paths or [
+            EvidencePath(
+                path_id="path-empty",
+                title="图证据未命中",
+                summary="已执行图扩展，但当前未形成可展示的证据路径。",
+                supports_items=[],
+                nodes=[],
+            )
+        ]
+
+    def _to_evidence_path_node(self, node: GraphEvidenceStepInput) -> EvidencePathNode:
+        node_type_map = {
+            "Repository": "service",
+            "File": "file",
+            "Class": "class",
+            "Function": "function",
+        }
+        return EvidencePathNode(
+            node_id=node.node_id,
+            label=node.name,
+            node_type=node_type_map.get(node.node_type, "service"),
+            relation_from_prev=node.relation_from_prev,
+            detail=node.path or node.name,
+        )
+
+    def _build_tool_findings(
+        self,
+        enabled: bool,
+        judgements: Iterable[ItemJudgement],
+        graph_evidence: GraphEvidenceBundle | None,
+    ) -> List[ToolFinding]:
+        if not enabled:
+            return []
+
+        findings: List[ToolFinding] = []
+        for item in judgements:
+            if item.status == "not_satisfied":
+                findings.append(
+                    ToolFinding(
+                        level="warning",
+                        message="建议对该要点补充 lint、typecheck 或规则检查结果。",
+                        related_item=item.item,
+                    )
+                )
+            elif item.status == "partially_satisfied":
+                findings.append(
+                    ToolFinding(
+                        level="info",
+                        message="建议人工确认图扩展得到的关键调用链是否完整。",
+                        related_item=item.item,
+                    )
+                )
+        if graph_evidence and graph_evidence.hints:
+            findings.append(
+                ToolFinding(
+                    level="info",
+                    message=f"图查询提示：{graph_evidence.hints[0]}",
+                    related_item=None,
+                )
+            )
+        return findings
 
     def _build_structural_gaps(
         self,
         judgements: List[ItemJudgement],
         evidence_paths: List[EvidencePath],
+        graph_evidence: GraphEvidenceBundle | None,
     ) -> List[str]:
         gaps = [f"缺少支撑“{item.item}”的约束或异常处理节点" for item in judgements if item.status == "not_satisfied"]
         if not evidence_paths or not evidence_paths[0].nodes:
             gaps.append("尚未形成可供复核的关键证据路径。")
+        if graph_evidence and graph_evidence.summary.matched_seed_count == 0:
+            gaps.append("图扩展未命中任何种子节点，需要检查 seed 路径、名称或签名条件。")
         if not gaps:
             gaps.append("当前报告未发现明显结构性断点，但仍建议人工确认关键路径。")
         return gaps
 
-    def _build_review_focuses(self, snippets: List[CandidateSnippet], missing_items: List[str]) -> List[str]:
+    def _build_review_focuses(
+        self,
+        snippets: List[CandidateSnippet],
+        missing_items: List[str],
+        graph_evidence: GraphEvidenceBundle | None,
+    ) -> List[str]:
         focuses = [f"优先复核 {snippet.filename}:{snippet.start_line}" for snippet in snippets[:2]]
+        if graph_evidence:
+            for path in graph_evidence.paths[:2]:
+                if path.nodes:
+                    focuses.append(f"复核图路径终点：{path.nodes[-1].name}")
         focuses.extend([f"补查要点：{item}" for item in missing_items[:2]])
         if not focuses:
             focuses.append("建议先补充候选代码，再开展审阅。")
@@ -411,7 +500,7 @@ class ConsistencyService:
         partial = len([item for item in judgements if item.status == "partially_satisfied"])
         return (
             f"共审阅 {total} 条要点，满足 {satisfied} 条，部分满足 {partial} 条，不满足 {len(missing_items)} 条。"
-            f" 当前示例报告综合得分 {overall_score:.3f}，置信度 {overall_confidence:.3f}。"
+            f" 当前综合得分 {overall_score:.3f}，置信度 {overall_confidence:.3f}。"
         )
 
     def _build_task_summary(self, task: dict) -> ReviewTaskSummary:
@@ -439,6 +528,7 @@ class ConsistencyService:
             owner=task["owner"],
             notes=task["notes"],
             candidate_snippets=[CandidateSnippet(**snippet) for snippet in task["candidate_snippets"]],
+            graph_evidence=GraphEvidenceBundle(**task["graph_evidence"]) if task.get("graph_evidence") else None,
             report=report,
             feedback_entries=feedback_entries,
         )
@@ -501,6 +591,27 @@ class ConsistencyService:
                     source="graph_expand",
                 ),
             ],
+            graph_evidence=GraphEvidenceBundle(
+                source="neo4j",
+                hints=["演示任务使用预置图证据。"],
+                summary={
+                    "matched_seed_count": 2,
+                    "expanded_node_count": 6,
+                    "expanded_edge_count": 5,
+                    "evidence_path_count": 2,
+                },
+                paths=[
+                    {
+                        "path_id": "demo-path-1",
+                        "hop_count": 2,
+                        "nodes": [
+                            {"node_id": "file:profile", "node_type": "File", "name": "ProfilePage.ets", "path": "src/profile/ProfilePage.ets"},
+                            {"node_id": "func:onSelectAvatar", "node_type": "Function", "name": "ProfilePage.onSelectAvatar", "path": "src/profile/ProfilePage.ets", "relation_from_prev": "CONTAINS"},
+                            {"node_id": "func:compress", "node_type": "Function", "name": "AvatarService.compress", "path": "src/profile/AvatarService.ets", "relation_from_prev": "CALLS"},
+                        ],
+                    }
+                ],
+            ),
         )
         detail = self.create_task(demo_request)
         task = self._tasks[detail.task.task_id]
@@ -528,4 +639,3 @@ class ConsistencyService:
 
     def _now(self) -> str:
         return datetime.now().replace(microsecond=0).isoformat()
-

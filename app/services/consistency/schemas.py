@@ -26,6 +26,34 @@ class AnalyzeOptions(BaseModel):
     enable_tool_evidence: bool = True
 
 
+class GraphEvidenceStepInput(BaseModel):
+    node_id: str
+    node_type: str
+    name: str
+    path: str = ""
+    relation_from_prev: str | None = None
+
+
+class GraphEvidencePathInput(BaseModel):
+    path_id: str
+    hop_count: int = Field(0, ge=0)
+    nodes: List[GraphEvidenceStepInput] = Field(default_factory=list)
+
+
+class GraphEvidenceSummaryInput(BaseModel):
+    matched_seed_count: int = 0
+    expanded_node_count: int = 0
+    expanded_edge_count: int = 0
+    evidence_path_count: int = 0
+
+
+class GraphEvidenceBundle(BaseModel):
+    source: str = "artifact"
+    hints: List[str] = Field(default_factory=list)
+    paths: List[GraphEvidencePathInput] = Field(default_factory=list)
+    summary: GraphEvidenceSummaryInput = Field(default_factory=GraphEvidenceSummaryInput)
+
+
 class RequirementSpec(BaseModel):
     intents: List[str] = Field(default_factory=list)
     constraints: List[str] = Field(default_factory=list)
@@ -89,6 +117,7 @@ class ConsistencyAnalyzeRequest(BaseModel):
     requirement_text: str = Field(..., min_length=1)
     acceptance_criteria: List[str] = Field(default_factory=list)
     candidate_snippets: List[CandidateSnippet] = Field(default_factory=list)
+    graph_evidence: GraphEvidenceBundle | None = None
     options: AnalyzeOptions = Field(default_factory=AnalyzeOptions)
 
 
@@ -108,6 +137,7 @@ class ReviewTaskCreateRequest(BaseModel):
     owner: str = ""
     notes: str = ""
     candidate_snippets: List[CandidateSnippet] = Field(default_factory=list)
+    graph_evidence: GraphEvidenceBundle | None = None
     options: AnalyzeOptions = Field(default_factory=AnalyzeOptions)
 
 
@@ -150,6 +180,7 @@ class ReviewTaskDetail(BaseModel):
     owner: str = ""
     notes: str = ""
     candidate_snippets: List[CandidateSnippet] = Field(default_factory=list)
+    graph_evidence: GraphEvidenceBundle | None = None
     report: ReviewReport | None = None
     feedback_entries: List[ReviewFeedback] = Field(default_factory=list)
 
@@ -180,4 +211,3 @@ class ReviewFeedbackRequest(BaseModel):
     decision: FeedbackDecision
     comment: str = ""
     reviewer: str = Field(..., min_length=1)
-
