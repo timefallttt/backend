@@ -114,6 +114,9 @@ class GraphPathStep(BaseModel):
     node_type: NodeType
     name: str
     path: str = ""
+    start_line: int | None = None
+    end_line: int | None = None
+    signature: str = ""
     relation_from_prev: EdgeType | None = None
 
 

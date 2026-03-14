@@ -237,6 +237,9 @@ class GraphQueryService:
                     node_type=node.node_type,
                     name=node.name,
                     path=node.path,
+                    start_line=node.start_line,
+                    end_line=node.end_line,
+                    signature=node.signature,
                     relation_from_prev=edge.edge_type if edge else None,
                 )
             )

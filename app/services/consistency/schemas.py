@@ -31,6 +31,10 @@ class GraphEvidenceStepInput(BaseModel):
     node_type: str
     name: str
     path: str = ""
+    start_line: int | None = None
+    end_line: int | None = None
+    signature: str = ""
+    code_excerpt: str = ""
     relation_from_prev: str | None = None
 
 
@@ -99,6 +103,54 @@ class ToolFinding(BaseModel):
     related_item: str | None = None
 
 
+class LlmEvidenceSnippet(BaseModel):
+    snippet_id: str
+    source: Literal["candidate", "diff_seed"]
+    filename: str
+    start_line: int
+    end_line: int
+    code: str
+    reason: str = ""
+
+
+class LlmEvidenceGraphNode(BaseModel):
+    node_id: str
+    label: str
+    node_type: NodeType
+    path: str = ""
+    start_line: int | None = None
+    end_line: int | None = None
+    signature: str = ""
+    code_excerpt: str = ""
+    relation_from_prev: str | None = None
+
+
+class LlmEvidencePath(BaseModel):
+    path_id: str
+    title: str
+    summary: str
+    supports_items: List[str] = Field(default_factory=list)
+    nodes: List[LlmEvidenceGraphNode] = Field(default_factory=list)
+
+
+class LlmEvidenceRequirementItem(BaseModel):
+    item: str
+    status_hint: JudgementStatus
+    snippet_ids: List[str] = Field(default_factory=list)
+    path_ids: List[str] = Field(default_factory=list)
+    negative_signals: List[str] = Field(default_factory=list)
+
+
+class LlmEvidencePack(BaseModel):
+    requirement_text: str
+    acceptance_criteria: List[str] = Field(default_factory=list)
+    snippets: List[LlmEvidenceSnippet] = Field(default_factory=list)
+    graph_paths: List[LlmEvidencePath] = Field(default_factory=list)
+    requirement_items: List[LlmEvidenceRequirementItem] = Field(default_factory=list)
+    structural_gaps: List[str] = Field(default_factory=list)
+    tool_findings: List[ToolFinding] = Field(default_factory=list)
+
+
 class ReviewReport(BaseModel):
     overall_score: float = Field(..., ge=0, le=1)
     overall_confidence: float = Field(..., ge=0, le=1)
@@ -110,6 +162,7 @@ class ReviewReport(BaseModel):
     evidence_paths: List[EvidencePath] = Field(default_factory=list)
     structural_gaps: List[str] = Field(default_factory=list)
     review_focuses: List[str] = Field(default_factory=list)
+    evidence_pack: LlmEvidencePack | None = None
     summary: str
 
 

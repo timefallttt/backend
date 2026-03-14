@@ -1,4 +1,5 @@
 ﻿import re
+from pathlib import Path
 from typing import Dict, List, Protocol
 
 from app.services.consistency.schemas import (
@@ -198,6 +199,15 @@ class WorkItemService:
                             node_type=node.node_type,
                             name=node.name,
                             path=node.path,
+                            start_line=node.start_line,
+                            end_line=node.end_line,
+                            signature=node.signature,
+                            code_excerpt=self._read_graph_node_excerpt(
+                                job,
+                                node.path,
+                                node.start_line,
+                                node.end_line,
+                            ),
                             relation_from_prev=node.relation_from_prev,
                         )
                         for node in path.nodes
@@ -215,3 +225,24 @@ class WorkItemService:
         filename = snippet.filename.replace('\\', '/').split('/')[-1]
         return filename.rsplit('.', 1)[0]
 
+    def _read_graph_node_excerpt(
+        self,
+        job: IndexJobDetail,
+        relative_path: str,
+        start_line: int | None,
+        end_line: int | None,
+    ) -> str:
+        if not relative_path or not job.snapshot.local_path:
+            return ''
+        file_path = Path(job.snapshot.local_path) / relative_path
+        if not file_path.exists() or not file_path.is_file():
+            return ''
+        try:
+            lines = file_path.read_text(encoding='utf-8', errors='replace').splitlines()
+        except OSError:
+            return ''
+        if start_line and end_line and start_line > 0 and end_line >= start_line:
+            excerpt_lines = lines[start_line - 1:min(end_line, len(lines))]
+        else:
+            excerpt_lines = lines[:20]
+        return '\n'.join(excerpt_lines[:40]).strip()

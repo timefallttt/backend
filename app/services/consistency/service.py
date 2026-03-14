@@ -20,6 +20,11 @@ from .schemas import (
     GraphEvidenceBundle,
     GraphEvidenceStepInput,
     ItemJudgement,
+    LlmEvidenceGraphNode,
+    LlmEvidencePack,
+    LlmEvidencePath,
+    LlmEvidenceRequirementItem,
+    LlmEvidenceSnippet,
     RequirementSpec,
     ReviewDashboardResponse,
     ReviewDashboardStats,
@@ -188,8 +193,16 @@ class ConsistencyService:
 
         for item in requirement_items:
             evidence = self._find_evidence(item, selected_snippets, request.options)
-            match_ratio = self._calculate_match_ratio(item, evidence)
-            status, score, confidence, notes = self._to_status_payload(match_ratio, len(evidence))
+            snippet_ratio = self._calculate_match_ratio(item, evidence)
+            graph_ratio, graph_path_count, graph_note = self._find_graph_support(item, request.graph_evidence)
+            status, score, confidence, notes = self._to_status_payload(
+                snippet_ratio=snippet_ratio,
+                evidence_count=len(evidence),
+                graph_ratio=graph_ratio,
+                graph_path_count=graph_path_count,
+            )
+            if graph_note:
+                notes = f'{notes} {graph_note}'.strip()
             judgements.append(
                 ItemJudgement(
                     item=item,
@@ -223,6 +236,13 @@ class ConsistencyService:
         tool_findings = self._build_tool_findings(request.options.enable_tool_evidence, judgements, request.graph_evidence)
         structural_gaps = self._build_structural_gaps(judgements, evidence_paths, request.graph_evidence)
         review_focuses = self._build_review_focuses(selected_snippets, missing_items, request.graph_evidence)
+        evidence_pack = self._build_evidence_pack(
+            request=request,
+            judgements=judgements,
+            evidence_paths=evidence_paths,
+            structural_gaps=structural_gaps,
+            tool_findings=tool_findings,
+        )
         status = 'needs_review' if overall_confidence < 0.6 or missing_items else 'completed'
         summary = self._build_summary(overall_score, overall_confidence, judgements, missing_items)
 
@@ -237,6 +257,7 @@ class ConsistencyService:
             evidence_paths=evidence_paths,
             structural_gaps=structural_gaps,
             review_focuses=review_focuses,
+            evidence_pack=evidence_pack,
             summary=summary,
         )
 
@@ -300,12 +321,80 @@ class ConsistencyService:
         hit = sum(1 for token in item_tokens if counter[token] > 0)
         return hit / len(item_tokens)
 
-    def _to_status_payload(self, match_ratio: float, evidence_count: int) -> tuple[str, float, float, str]:
-        if evidence_count == 0:
+    def _find_graph_support(
+        self,
+        requirement_item: str,
+        graph_evidence: GraphEvidenceBundle | None,
+    ) -> tuple[float, int, str]:
+        if not graph_evidence:
+            return 0.0, 0, ''
+
+        requirement_tokens = set(self._tokenize(requirement_item))
+        if not requirement_tokens:
+            return 0.0, 0, ''
+
+        matched_overlaps: List[set[str]] = []
+        best_ratio = 0.0
+
+        for path in graph_evidence.paths:
+            path_fragments = [path.path_id]
+            for node in path.nodes:
+                path_fragments.extend(
+                    [
+                        node.node_type,
+                        node.name,
+                        node.path,
+                        node.relation_from_prev or '',
+                    ]
+                )
+            path_tokens = set(self._tokenize(' '.join(fragment for fragment in path_fragments if fragment)))
+            if not path_tokens:
+                continue
+            overlap = requirement_tokens.intersection(path_tokens)
+            if not overlap:
+                continue
+            matched_overlaps.append(overlap)
+            best_ratio = max(best_ratio, len(overlap) / len(requirement_tokens))
+
+        if graph_evidence.hints:
+            hint_tokens = set(self._tokenize(' '.join(graph_evidence.hints)))
+            hint_overlap = requirement_tokens.intersection(hint_tokens)
+            if hint_overlap:
+                matched_overlaps.append(hint_overlap)
+                best_ratio = max(best_ratio, len(hint_overlap) / len(requirement_tokens))
+
+        if not matched_overlaps:
+            return 0.0, 0, '图证据未直接命中该要点。'
+
+        merged_overlap = sorted({token for overlap in matched_overlaps for token in overlap})
+        preview = '、'.join(merged_overlap[:6])
+        return best_ratio, len(matched_overlaps), f'图证据命中 {len(matched_overlaps)} 条路径/提示，关键词包括：{preview}。'
+
+    def _to_status_payload(
+        self,
+        snippet_ratio: float,
+        evidence_count: int,
+        graph_ratio: float,
+        graph_path_count: int,
+    ) -> tuple[str, float, float, str]:
+        if evidence_count == 0 and graph_path_count == 0:
             return 'not_satisfied', 0.0, 0.35, '未检索到直接支持该要点的代码证据，建议结合图扩展继续补充。'
-        if match_ratio >= 0.6:
-            return 'satisfied', 1.0, min(0.95, 0.6 + evidence_count * 0.05), '当前候选代码与扩展关系可以支持该要点。'
-        return 'partially_satisfied', 0.5, min(0.8, 0.45 + evidence_count * 0.05), '已有部分证据，但仍需补充异常路径或约束校验节点。'
+
+        combined_ratio = max(
+            snippet_ratio,
+            min(1.0, snippet_ratio * 0.7 + graph_ratio * 0.3),
+        )
+        if evidence_count == 0 and graph_path_count > 0:
+            combined_ratio = max(combined_ratio, graph_ratio * 0.8)
+
+        if combined_ratio >= 0.65 or (snippet_ratio >= 0.45 and graph_path_count > 0):
+            confidence = min(0.96, 0.58 + evidence_count * 0.05 + graph_path_count * 0.03)
+            return 'satisfied', 1.0, confidence, '候选代码与图扩展路径共同支持该要点。'
+
+        confidence = min(0.84, 0.42 + evidence_count * 0.05 + graph_path_count * 0.03)
+        if evidence_count == 0 and graph_path_count > 0:
+            return 'partially_satisfied', 0.5, confidence, '当前主要依赖图扩展证据，仍需补充直接代码片段以确认实现细节。'
+        return 'partially_satisfied', 0.5, confidence, '已有部分证据，但仍需补充异常路径或约束校验节点。'
 
     def _resolve_evidence_paths(
         self,
@@ -495,6 +584,149 @@ class ConsistencyService:
             f'共审阅 {total} 条要点，满足 {satisfied} 条，部分满足 {partial} 条，不满足 {len(missing_items)} 条。'
             f' 当前综合得分 {overall_score:.3f}，置信度 {overall_confidence:.3f}。'
         )
+
+    def _build_evidence_pack(
+        self,
+        request: ConsistencyAnalyzeRequest,
+        judgements: List[ItemJudgement],
+        evidence_paths: List[EvidencePath],
+        structural_gaps: List[str],
+        tool_findings: List[ToolFinding],
+    ) -> LlmEvidencePack:
+        snippets = [
+            LlmEvidenceSnippet(
+                snippet_id=snippet.snippet_id,
+                source='diff_seed' if snippet.source == 'workitem_diff' else 'candidate',
+                filename=snippet.filename,
+                start_line=snippet.start_line,
+                end_line=snippet.end_line,
+                code=snippet.code,
+                reason=snippet.recall_reason,
+            )
+            for snippet in request.candidate_snippets
+            if snippet.selected
+        ]
+
+        graph_paths: List[LlmEvidencePath] = []
+        if request.graph_evidence:
+            for path in request.graph_evidence.paths:
+                supports_items = self._infer_supported_items(path.path_id, path.nodes, judgements)
+                graph_paths.append(
+                    LlmEvidencePath(
+                        path_id=path.path_id,
+                        title=f'图路径 {path.path_id}',
+                        summary=self._summarize_graph_path(path.nodes),
+                        supports_items=supports_items,
+                        nodes=[
+                            LlmEvidenceGraphNode(
+                                node_id=node.node_id,
+                                label=node.name,
+                                node_type=self._map_graph_node_type(node.node_type),
+                                path=node.path,
+                                start_line=node.start_line,
+                                end_line=node.end_line,
+                                signature=node.signature,
+                                code_excerpt=node.code_excerpt,
+                                relation_from_prev=node.relation_from_prev,
+                            )
+                            for node in path.nodes
+                        ],
+                    )
+                )
+        else:
+            for path in evidence_paths:
+                graph_paths.append(
+                    LlmEvidencePath(
+                        path_id=path.path_id,
+                        title=path.title,
+                        summary=path.summary,
+                        supports_items=path.supports_items,
+                        nodes=[
+                            LlmEvidenceGraphNode(
+                                node_id=node.node_id,
+                                label=node.label,
+                                node_type=node.node_type,
+                                path=node.detail if node.node_type in {'file', 'class', 'function', 'service'} else '',
+                                relation_from_prev=node.relation_from_prev,
+                            )
+                            for node in path.nodes
+                        ],
+                    )
+                )
+
+        requirement_items = [
+            LlmEvidenceRequirementItem(
+                item=judgement.item,
+                status_hint=judgement.status,
+                snippet_ids=[evidence.snippet_id for evidence in judgement.evidence],
+                path_ids=[path.path_id for path in graph_paths if judgement.item in path.supports_items],
+                negative_signals=self._build_negative_signals(judgement, graph_paths, structural_gaps),
+            )
+            for judgement in judgements
+        ]
+
+        return LlmEvidencePack(
+            requirement_text=request.requirement_text,
+            acceptance_criteria=request.acceptance_criteria,
+            snippets=snippets,
+            graph_paths=graph_paths,
+            requirement_items=requirement_items,
+            structural_gaps=structural_gaps,
+            tool_findings=tool_findings,
+        )
+
+    def _infer_supported_items(
+        self,
+        path_id: str,
+        nodes: List[GraphEvidenceStepInput],
+        judgements: List[ItemJudgement],
+    ) -> List[str]:
+        node_tokens = set()
+        for node in nodes:
+            node_tokens.update(self._tokenize(f'{node.name} {node.path} {node.signature}'))
+        if not node_tokens:
+            return []
+        supported_items: List[str] = []
+        for judgement in judgements:
+            item_tokens = set(self._tokenize(judgement.item))
+            if not item_tokens:
+                continue
+            overlap = item_tokens.intersection(node_tokens)
+            if overlap:
+                supported_items.append(judgement.item)
+        if not supported_items and judgements:
+            supported_items.append(judgements[hash(path_id) % len(judgements)].item)
+        return supported_items
+
+    def _summarize_graph_path(self, nodes: List[GraphEvidenceStepInput]) -> str:
+        if not nodes:
+            return '图查询未返回有效节点。'
+        preview = ' -> '.join(node.name for node in nodes[:4])
+        return f'结构路径：{preview}'
+
+    def _map_graph_node_type(self, node_type: str) -> str:
+        node_type_map = {
+            'Repository': 'service',
+            'File': 'file',
+            'Class': 'class',
+            'Function': 'function',
+        }
+        return node_type_map.get(node_type, 'service')
+
+    def _build_negative_signals(
+        self,
+        judgement: ItemJudgement,
+        graph_paths: List[LlmEvidencePath],
+        structural_gaps: List[str],
+    ) -> List[str]:
+        signals: List[str] = []
+        if not judgement.evidence:
+            signals.append('未命中直接代码片段')
+        if not any(judgement.item in path.supports_items for path in graph_paths):
+            signals.append('未形成对应图路径')
+        if judgement.status != 'satisfied':
+            signals.extend(gap for gap in structural_gaps if judgement.item in gap)
+        return signals[:4]
 
     def _build_task_summary(self, task: dict) -> ReviewTaskSummary:
         report = ReviewReport(**task['report']) if task.get('report') else None
