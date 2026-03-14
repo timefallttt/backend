@@ -151,6 +151,14 @@ class LlmEvidencePack(BaseModel):
     tool_findings: List[ToolFinding] = Field(default_factory=list)
 
 
+class LlmRequestPreview(BaseModel):
+    mode: Literal["preview"] = "preview"
+    provider: str = "pending"
+    model_name: str = "pending"
+    summary: str
+    request_body: dict = Field(default_factory=dict)
+
+
 class ReviewReport(BaseModel):
     overall_score: float = Field(..., ge=0, le=1)
     overall_confidence: float = Field(..., ge=0, le=1)
@@ -163,6 +171,7 @@ class ReviewReport(BaseModel):
     structural_gaps: List[str] = Field(default_factory=list)
     review_focuses: List[str] = Field(default_factory=list)
     evidence_pack: LlmEvidencePack | None = None
+    llm_request_preview: LlmRequestPreview | None = None
     summary: str
 
 

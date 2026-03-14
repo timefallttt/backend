@@ -25,6 +25,7 @@ from .schemas import (
     LlmEvidencePath,
     LlmEvidenceRequirementItem,
     LlmEvidenceSnippet,
+    LlmRequestPreview,
     RequirementSpec,
     ReviewDashboardResponse,
     ReviewDashboardStats,
@@ -249,6 +250,7 @@ class ConsistencyService:
             structural_gaps=structural_gaps,
             tool_findings=tool_findings,
         )
+        llm_request_preview = self._build_llm_request_preview(evidence_pack)
         status = 'needs_review' if overall_confidence < 0.6 or missing_items else 'completed'
         summary = self._build_summary(overall_score, overall_confidence, judgements, missing_items)
 
@@ -264,6 +266,7 @@ class ConsistencyService:
             structural_gaps=structural_gaps,
             review_focuses=review_focuses,
             evidence_pack=evidence_pack,
+            llm_request_preview=llm_request_preview,
             summary=summary,
         )
 
@@ -733,6 +736,46 @@ class ConsistencyService:
         if judgement.status != 'satisfied':
             signals.extend(gap for gap in structural_gaps if judgement.item in gap)
         return signals[:4]
+
+    def _build_llm_request_preview(self, evidence_pack: LlmEvidencePack) -> LlmRequestPreview:
+        request_body = {
+            'provider': 'pending',
+            'model': 'pending',
+            'messages': [
+                {
+                    'role': 'system',
+                    'content': (
+                        '你是需求实现审阅助手。请基于提供的需求、验收标准、代码片段、'
+                        '图路径和缺口信号，判断每条需求要点是否满足，并给出可复核理由。'
+                    ),
+                },
+                {
+                    'role': 'user',
+                    'content': {
+                        'requirement_text': evidence_pack.requirement_text,
+                        'acceptance_criteria': evidence_pack.acceptance_criteria,
+                        'requirement_items': [item.model_dump() for item in evidence_pack.requirement_items],
+                        'snippets': [snippet.model_dump() for snippet in evidence_pack.snippets],
+                        'graph_paths': [path.model_dump() for path in evidence_pack.graph_paths],
+                        'structural_gaps': evidence_pack.structural_gaps,
+                        'tool_findings': [finding.model_dump() for finding in evidence_pack.tool_findings],
+                    },
+                },
+            ],
+            'response_format': {
+                'type': 'json_object',
+                'expected_fields': [
+                    'summary',
+                    'item_assessments',
+                    'overall_verdict',
+                    'manual_review_needed',
+                ],
+            },
+        }
+        return LlmRequestPreview(
+            summary='当前尚未实际调用大模型，以下内容为该任务拟提交给大模型的请求体。',
+            request_body=request_body,
+        )
 
     def _build_task_summary(self, task: dict) -> ReviewTaskSummary:
         report = ReviewReport(**task['report']) if task.get('report') else None
