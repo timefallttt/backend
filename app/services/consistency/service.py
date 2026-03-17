@@ -234,14 +234,9 @@ class ConsistencyService:
         requirement_items = self._build_requirement_items(request.requirement_text, request.acceptance_criteria)
         selected_snippets = [snippet for snippet in request.candidate_snippets if snippet.selected]
         evidence_paths = self._resolve_evidence_paths(request.graph_evidence)
-        snippet_map = self._map_snippets_to_items(requirement_items, selected_snippets, request.options)
-        path_map = self._map_paths_to_items(requirement_items, request.graph_evidence)
         tool_findings, structural_gaps = self._build_objective_signals(
-            requirement_items=requirement_items,
             selected_snippets=selected_snippets,
             graph_evidence=request.graph_evidence,
-            snippet_map=snippet_map,
-            path_map=path_map,
         )
         review_focuses = self._build_review_focuses(selected_snippets, request.graph_evidence)
         evidence_pack = self._build_evidence_pack(
@@ -290,51 +285,6 @@ class ConsistencyService:
                 merged.append(item)
         return merged
 
-    def _tokenize(self, text: str) -> List[str]:
-        cleaned = re.sub(r'[^\w\u4e00-\u9fff]+', ' ', text.lower())
-        return [token.strip() for token in cleaned.split() if len(token.strip()) > 1]
-
-    def _map_snippets_to_items(
-        self,
-        requirement_items: List[str],
-        snippets: List[CandidateSnippet],
-        options: AnalyzeOptions,
-    ) -> Dict[str, List[CandidateSnippet]]:
-        result: Dict[str, List[CandidateSnippet]] = {item: [] for item in requirement_items}
-        for item in requirement_items:
-            item_tokens = set(self._tokenize(item))
-            if not item_tokens:
-                continue
-            for snippet in snippets[: options.top_k]:
-                snippet_tokens = set(self._tokenize(f'{snippet.filename}\n{snippet.code}\n{snippet.recall_reason}'))
-                if not snippet_tokens:
-                    continue
-                overlap = item_tokens.intersection(snippet_tokens)
-                if len(overlap) / len(item_tokens) >= options.keyword_min_overlap:
-                    result[item].append(snippet)
-        return result
-
-    def _map_paths_to_items(
-        self,
-        requirement_items: List[str],
-        graph_evidence: GraphEvidenceBundle | None,
-    ) -> Dict[str, List[GraphEvidenceStepInput]]:
-        result: Dict[str, List[GraphEvidenceStepInput]] = {item: [] for item in requirement_items}
-        if not graph_evidence:
-            return result
-
-        for item in requirement_items:
-            item_tokens = set(self._tokenize(item))
-            if not item_tokens:
-                continue
-            for path in graph_evidence.paths:
-                path_tokens = set()
-                for node in path.nodes:
-                    path_tokens.update(self._tokenize(f'{node.name} {node.path} {node.signature}'))
-                if item_tokens.intersection(path_tokens):
-                    result[item].append(path)
-        return result
-
     def _resolve_evidence_paths(self, graph_evidence: GraphEvidenceBundle | None) -> List[EvidencePath]:
         if not graph_evidence or not graph_evidence.paths:
             return []
@@ -372,11 +322,8 @@ class ConsistencyService:
 
     def _build_objective_signals(
         self,
-        requirement_items: List[str],
         selected_snippets: List[CandidateSnippet],
         graph_evidence: GraphEvidenceBundle | None,
-        snippet_map: Dict[str, List[CandidateSnippet]],
-        path_map: Dict[str, List[GraphEvidenceStepInput]],
     ) -> tuple[List[ToolFinding], List[str]]:
         findings: List[ToolFinding] = []
         signals: List[str] = []
@@ -395,12 +342,6 @@ class ConsistencyService:
             if not graph_evidence.paths:
                 findings.append(ToolFinding(level='warning', message='当前未形成图路径。'))
                 signals.append('当前未形成图路径。')
-
-        for item in requirement_items:
-            has_snippet = bool(snippet_map.get(item))
-            has_path = bool(path_map.get(item))
-            if not has_snippet and not has_path:
-                signals.append(f'要点“{item}”当前未关联到代码片段或图路径。')
 
         if not signals:
             findings.append(ToolFinding(level='info', message='当前原始证据已整理完成，可提交大模型审阅。'))
