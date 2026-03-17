@@ -12,16 +12,16 @@ class Neo4jGraphStore:
     def write_graph(self, snapshot_id: str, artifact: GraphArtifact) -> tuple[str, list[str]]:
         if not self.is_configured():
             return "pending_setup", [
-                "未检测到完整的 Neo4j 连接配置，图工件已生成但尚未写入图库。",
-                "请检查 NEO4J_URI、NEO4J_USERNAME、NEO4J_PASSWORD 的配置。",
+                "Neo4j connection is not fully configured. The graph artifact was generated but not written to the graph store.",
+                "Check NEO4J_URI, NEO4J_USERNAME, and NEO4J_PASSWORD.",
             ]
 
         try:
             driver = self._create_driver()
         except ModuleNotFoundError:
             return "pending_setup", [
-                "未安装 neo4j Python 驱动，暂时无法写入图数据库。",
-                "请先执行 pip install neo4j，然后重新运行建库任务。",
+                "The neo4j Python driver is not installed, so the graph cannot be written to Neo4j.",
+                "Install it with pip install neo4j and rerun indexing.",
             ]
 
         try:
@@ -67,14 +67,14 @@ class Neo4jGraphStore:
                     )
         except Exception as exc:
             return "failed", [
-                f"Neo4j 写入失败：{exc}",
-                "请确认 Neo4j 已通过 neo4j console 启动，并检查账号密码是否正确。",
+                f"Failed to write graph data to Neo4j: {exc}",
+                "Ensure Neo4j is running and the configured credentials are valid.",
             ]
         finally:
             driver.close()
 
         return "loaded", [
-            "图数据已写入 Neo4j，可继续实现图查询和证据扩展接口。",
+            "Graph data was written to Neo4j and is ready for evidence queries.",
         ]
 
     def query_subgraph(
@@ -158,7 +158,7 @@ class Neo4jGraphStore:
                     snapshot_id=snapshot_id,
                 )
         except Exception as exc:
-            return False, [f"Neo4j 清理失败：{exc}"]
+            return False, [f"Failed to clean Neo4j snapshot: {exc}"]
         finally:
             driver.close()
 
@@ -173,11 +173,12 @@ class Neo4jGraphStore:
         filters = []
         parameters = {
             "snapshot_id": snapshot_id,
-            "limit": seed.max_matches,
+            "candidate_limit": max(seed.max_matches * 12, 24),
             "node_id": seed.node_id,
             "name": seed.name,
             "path": seed.path.replace("\\", "/"),
             "signature": seed.signature,
+            "dot_name": f".{seed.name.lower()}" if seed.name else "",
         }
 
         if seed.node_id:
@@ -185,7 +186,11 @@ class Neo4jGraphStore:
         if seed.path:
             filters.append("toLower(n.path) = toLower($path)")
         if seed.name:
-            filters.append("toLower(n.name) CONTAINS toLower($name)")
+            filters.append(
+                "toLower(n.name) = toLower($name) "
+                "OR toLower(n.name) ENDS WITH $dot_name "
+                "OR toLower(n.name) CONTAINS toLower($name)"
+            )
         if seed.signature:
             filters.append("n.signature CONTAINS $signature")
 
@@ -196,10 +201,53 @@ class Neo4jGraphStore:
             MATCH (snap:RepositorySnapshot {{snapshot_id: $snapshot_id}})-[:CONTAINS]->(n:CodeNode)
             WHERE {' OR '.join(filters)}
             RETURN DISTINCT n
-            LIMIT $limit
+            LIMIT $candidate_limit
         """
         result = session.run(query, parameters)
-        return [self._graph_node_from_neo4j(record["n"]) for record in result]
+        candidates = [self._graph_node_from_neo4j(record["n"]) for record in result]
+        scored: list[tuple[int, int, GraphNode]] = []
+        normalized_path = seed.path.replace("\\", "/").lower()
+        normalized_name = seed.name.lower()
+        for node in candidates:
+            score = 0
+            if seed.node_id and node.node_id == seed.node_id:
+                score += 1000
+            if seed.path and node.path.lower() == normalized_path:
+                score += 80
+                score += self._path_match_type_bonus(node)
+            if seed.name:
+                node_name = node.name.lower()
+                if node_name == normalized_name or node_name.endswith(f'.{normalized_name}'):
+                    score += 320
+                elif normalized_name in node_name:
+                    score += 220
+            if seed.signature and seed.signature in node.signature:
+                score += 260
+            if seed.path and seed.name and node.path.lower() == normalized_path and normalized_name in node.name.lower():
+                score += 180
+            if score > 0:
+                scored.append((score, self._node_type_rank(node), node))
+
+        scored.sort(key=lambda item: (item[0], item[1], len(item[2].name)), reverse=True)
+        return [node for _, _, node in scored[: seed.max_matches]]
+
+    def _node_type_rank(self, node: GraphNode) -> int:
+        if node.node_type == 'Function':
+            return 3
+        if node.node_type == 'Class':
+            return 2
+        if node.node_type == 'File':
+            return 1
+        return 0
+
+    def _path_match_type_bonus(self, node: GraphNode) -> int:
+        if node.node_type == 'Function':
+            return 60
+        if node.node_type == 'Class':
+            return 40
+        if node.node_type == 'File':
+            return 10
+        return 0
 
     def _build_path_query(self, max_hops: int, direction: str) -> str:
         if direction == "outgoing":

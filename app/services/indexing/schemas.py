@@ -117,7 +117,7 @@ class GraphPathStep(BaseModel):
     start_line: int | None = None
     end_line: int | None = None
     signature: str = ""
-    relation_from_prev: EdgeType | None = None
+    relation_from_prev: str | None = None
 
 
 class GraphEvidencePath(BaseModel):

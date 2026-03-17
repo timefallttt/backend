@@ -439,23 +439,44 @@ class ConsistencyService:
 
     def _sort_graph_paths_for_llm(self, paths: List[LlmEvidencePath]) -> List[LlmEvidencePath]:
         def score(path: LlmEvidencePath) -> tuple[int, int, int]:
-            call_count = sum(1 for node in path.nodes if node.relation_from_prev == 'CALLS')
+            direct_call_count = sum(1 for node in path.nodes if node.relation_from_prev == 'CALLS')
+            reverse_call_count = sum(1 for node in path.nodes if node.relation_from_prev == 'CALLED_BY')
+            call_count = sum(
+                1 for node in path.nodes if node.relation_from_prev in {'CALLS', 'CALLED_BY'}
+            )
             function_count = sum(1 for node in path.nodes if node.node_type == 'function')
             file_count = sum(1 for node in path.nodes if node.node_type == 'file')
+            anonymous_penalty = sum(1 for node in path.nodes if node.label.startswith('%')) * 8
+            constructor_penalty = sum(1 for node in path.nodes if node.label.endswith('.constructor') or node.label == 'constructor') * 6
+            reverse_penalty = reverse_call_count * 3
             terminal = path.nodes[-1] if path.nodes else None
             terminal_penalty = 0
             if terminal and terminal.node_type == 'file':
                 terminal_penalty -= 8
             if terminal and terminal.label.startswith('%'):
                 terminal_penalty -= 3
-            return (call_count * 20 + function_count * 6 - file_count * 2 + terminal_penalty, call_count, -len(path.nodes))
+            weighted = (
+                direct_call_count * 24
+                + reverse_call_count * 16
+                + function_count * 6
+                - file_count * 2
+                - anonymous_penalty
+                - constructor_penalty
+                - reverse_penalty
+                - len(path.nodes) * 2
+                + terminal_penalty
+            )
+            return (weighted, direct_call_count, call_count)
 
         return sorted(paths, key=score, reverse=True)
 
     def _build_llm_request_preview(self, evidence_pack: LlmEvidencePack) -> LlmRequestPreview:
         system_message = (
             '你是需求实现审阅助手。请仅基于给定的原始证据进行判断，不要参考任何先验结论，'
-            '不要臆造未提供的实现。你需要对每条验收标准给出 '
+            '不要臆造未提供的实现。代码片段证据通常是实现细节的主证据，'
+            '图路径证据通常用于补充调用关系、上下文和影响范围；'
+            '如果某些图路径与需求明显无关或只是通用日志/框架细节，你可以忽略它们。'
+            '你需要对每条验收标准给出 '
             'satisfied/partially_satisfied/not_satisfied 结论、可复核理由、'
             '引用的证据片段和图路径，并指出是否需要人工复核。'
         )
@@ -484,6 +505,8 @@ class ConsistencyService:
                     '以下输入不包含系统先验判定结果。',
                     '若证据不足，请明确指出缺失证据类型，而不是依据猜测下结论。',
                     '请你自行判断每条验收标准与哪些证据相关，不要假设系统已经完成证据归因。',
+                    '代码片段优先用于判断具体实现是否存在；图路径优先用于判断调用关系和上下文。',
+                    '如果图路径只体现通用日志、框架回调或与验收标准无直接关系的内部细节，可以降低其权重或忽略。',
                 ],
             },
             'evidence_pool': {
@@ -525,6 +548,8 @@ class ConsistencyService:
     def _build_llm_user_message(self, evidence_pack: LlmEvidencePack) -> str:
         lines: List[str] = []
         lines.append('请基于下面的需求与原始证据，逐条审阅每条验收标准是否已被当前实现满足。')
+        lines.append('判断时请优先依据代码片段确认具体实现，再结合图路径理解调用关系和上下文。')
+        lines.append('如果某条图路径只是日志、框架回调或其他与需求无直接关系的内部细节，可以忽略。')
         lines.append('')
         lines.append('一、需求描述')
         lines.append(evidence_pack.requirement_text or '未提供。')
@@ -555,6 +580,7 @@ class ConsistencyService:
             for path in selected_paths:
                 lines.append(f'- 路径 {path.path_id}')
                 lines.append(f'  摘要：{self._render_graph_path_summary(path)}')
+                has_non_seed_excerpt = any(self._trim_excerpt(node.code_excerpt) for node in path.nodes[1:])
                 for node in path.nodes[:4]:
                     node_header = f'  节点：{node.label} [{node.node_type}]'
                     if node.path:
@@ -563,6 +589,8 @@ class ConsistencyService:
                         node_header += f' <{node.relation_from_prev}>'
                     lines.append(node_header)
                     excerpt = self._trim_excerpt(node.code_excerpt)
+                    if has_non_seed_excerpt and node is path.nodes[0]:
+                        continue
                     if excerpt and node.node_id not in seen_excerpt_nodes:
                         seen_excerpt_nodes.add(node.node_id)
                         lines.append('  代码摘录：')
@@ -602,10 +630,66 @@ class ConsistencyService:
 
 
     def _select_graph_paths_for_prompt(self, paths: List[LlmEvidencePath]) -> List[LlmEvidencePath]:
-        call_paths = [path for path in paths if any(node.relation_from_prev == 'CALLS' for node in path.nodes)]
+        clean_call_paths = [
+            path
+            for path in paths
+            if any(node.relation_from_prev in {'CALLS', 'CALLED_BY'} for node in path.nodes)
+            and self._is_prompt_path_clean(path)
+        ]
+        if clean_call_paths:
+            return self._dedupe_prompt_paths(clean_call_paths)[:6]
+
+        call_paths = [
+            path
+            for path in paths
+            if any(node.relation_from_prev in {'CALLS', 'CALLED_BY'} for node in path.nodes)
+        ]
         if call_paths:
-            return call_paths[:6]
-        return paths[:4]
+            return self._dedupe_prompt_paths(call_paths)[:6]
+
+        clean_paths = [path for path in paths if self._is_prompt_path_clean(path)]
+        if clean_paths:
+            return self._dedupe_prompt_paths(clean_paths)[:4]
+        return self._dedupe_prompt_paths(paths)[:4]
+
+    def _is_prompt_path_clean(self, path: LlmEvidencePath) -> bool:
+        tail = path.nodes[-1] if path.nodes else None
+        if not tail:
+            return False
+        if self._is_internal_graph_label(tail.label):
+            return False
+        internal_middle = [
+            node for node in path.nodes[1:]
+            if self._is_internal_graph_label(node.label)
+        ]
+        if internal_middle and len(path.nodes) <= 3:
+            return False
+        return True
+
+    def _dedupe_prompt_paths(self, paths: List[LlmEvidencePath]) -> List[LlmEvidencePath]:
+        selected: List[LlmEvidencePath] = []
+        seen_terminals: set[tuple[str, str]] = set()
+        for path in paths:
+            terminal = path.nodes[-1] if path.nodes else None
+            if not terminal:
+                continue
+            key = (terminal.label, terminal.relation_from_prev or '')
+            if key in seen_terminals:
+                continue
+            seen_terminals.add(key)
+            selected.append(path)
+        return selected
+
+    def _is_internal_graph_label(self, label: str) -> bool:
+        return (
+            label.startswith('%')
+            or '.%' in label
+            or '%AC$' in label
+            or label.endswith('.constructor')
+            or label == 'constructor'
+            or label.endswith('.%instInit')
+            or label.endswith('.%statInit')
+        )
 
     def _trim_excerpt(self, code_excerpt: str) -> str:
         if not code_excerpt:

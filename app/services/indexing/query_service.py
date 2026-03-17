@@ -114,10 +114,7 @@ class GraphQueryService:
         if not seed_node_ids:
             return seed_matches, [], []
 
-        adjacency: dict[str, list[tuple[str, GraphEdge]]] = {}
-        for edge in edges:
-            adjacency.setdefault(edge.source_id, []).append((edge.target_id, edge))
-            adjacency.setdefault(edge.target_id, []).append((edge.source_id, edge))
+        adjacency = self._build_traversal_adjacency(edges)
 
         visited = {node_id: 0 for node_id in seed_node_ids}
         queue = deque((node_id, 0) for node_id in seed_node_ids)
@@ -128,7 +125,7 @@ class GraphQueryService:
             if depth >= request.max_hops:
                 continue
 
-            for neighbor_id, edge in adjacency.get(current_id, []):
+            for neighbor_id, _, edge in adjacency.get(current_id, []):
                 next_depth = depth + 1
                 if neighbor_id not in visited or next_depth < visited[neighbor_id]:
                     visited[neighbor_id] = next_depth
@@ -180,27 +177,24 @@ class GraphQueryService:
         max_paths: int,
     ) -> list[GraphEvidencePath]:
         nodes_by_id = {node.node_id: node for node in nodes}
-        adjacency: dict[str, list[tuple[str, GraphEdge]]] = {}
-        for edge in edges:
-            adjacency.setdefault(edge.source_id, []).append((edge.target_id, edge))
-            adjacency.setdefault(edge.target_id, []).append((edge.source_id, edge))
+        adjacency = self._build_traversal_adjacency(edges)
 
         paths: list[GraphEvidencePath] = []
         seen_path_ids: set[str] = set()
         for match in seed_matches:
             for seed_node in match.matched_nodes:
                 queue = deque([(seed_node.node_id, 0)])
-                parents: dict[str, tuple[str | None, GraphEdge | None]] = {
+                parents: dict[str, tuple[str | None, str | None]] = {
                     seed_node.node_id: (None, None)
                 }
                 while queue and len(paths) < max_paths:
                     current_id, depth = queue.popleft()
                     if depth >= max_hops:
                         continue
-                    for neighbor_id, edge in adjacency.get(current_id, []):
+                    for neighbor_id, relation_label, _ in adjacency.get(current_id, []):
                         if neighbor_id in parents:
                             continue
-                        parents[neighbor_id] = (current_id, edge)
+                        parents[neighbor_id] = (current_id, relation_label)
                         queue.append((neighbor_id, depth + 1))
 
                 for target_id, (parent_id, _) in parents.items():
@@ -221,21 +215,21 @@ class GraphQueryService:
     def _trace_path(
         self,
         target_id: str,
-        parents: dict[str, tuple[str | None, GraphEdge | None]],
+        parents: dict[str, tuple[str | None, str | None]],
         nodes_by_id: dict[str, GraphNode],
     ) -> GraphEvidencePath:
-        chain: list[tuple[str, GraphEdge | None]] = []
+        chain: list[tuple[str, str | None]] = []
         current_id = target_id
         while current_id in parents:
-            parent_id, edge = parents[current_id]
-            chain.append((current_id, edge))
+            parent_id, relation_label = parents[current_id]
+            chain.append((current_id, relation_label))
             if parent_id is None:
                 break
             current_id = parent_id
 
         chain.reverse()
         steps: list[GraphPathStep] = []
-        for node_id, edge in chain:
+        for node_id, relation_label in chain:
             node = nodes_by_id.get(node_id)
             if not node:
                 continue
@@ -248,7 +242,7 @@ class GraphQueryService:
                     start_line=node.start_line,
                     end_line=node.end_line,
                     signature=node.signature,
-                    relation_from_prev=edge.edge_type if edge else None,
+                    relation_from_prev=relation_label,
                 )
             )
 
@@ -281,4 +275,23 @@ class GraphQueryService:
         if node.node_type == 'File':
             return 10
         return 0
+
+    def _build_traversal_adjacency(
+        self,
+        edges: list[GraphEdge],
+    ) -> dict[str, list[tuple[str, str, GraphEdge]]]:
+        adjacency: dict[str, list[tuple[str, str, GraphEdge]]] = {}
+        for edge in edges:
+            adjacency.setdefault(edge.source_id, []).append((edge.target_id, edge.edge_type, edge))
+            adjacency.setdefault(edge.target_id, []).append(
+                (edge.source_id, self._reverse_relation_label(edge.edge_type), edge)
+            )
+        return adjacency
+
+    def _reverse_relation_label(self, edge_type: str) -> str:
+        reverse_map = {
+            'CALLS': 'CALLED_BY',
+            'CONTAINS': 'CONTAINED_BY',
+        }
+        return reverse_map.get(edge_type, edge_type)
 

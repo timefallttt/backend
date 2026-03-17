@@ -203,11 +203,8 @@ class WorkItemService:
         item: WorkItemDetail,
     ) -> GraphEvidenceBundle | None:
         snippets = self._to_candidate_snippets(item)
-        seeds = [
-            self._build_seed_query(snippet)
-            for snippet in snippets
-        ]
-        if not any(seed.path or seed.name or seed.signature for seed in seeds):
+        seeds = self._build_graph_seed_queries(snippets)
+        if not seeds:
             return None
 
         response = self._graph_query_service.query_job_evidence(
@@ -242,6 +239,7 @@ class WorkItemService:
                                 node.start_line,
                                 node.end_line,
                                 node.node_type,
+                                node.name,
                                 self._find_fallback_snippet(node, snippets),
                             ),
                             relation_from_prev=node.relation_from_prev,
@@ -268,15 +266,62 @@ class WorkItemService:
 
     def _build_seed_query(self, snippet: CandidateSnippet) -> GraphSeedQuery:
         seed_name = self._guess_seed_name(snippet)
-        filename_stem = snippet.filename.replace('\\', '/').split('/')[-1].rsplit('.', 1)[0]
         signature = snippet.code.splitlines()[0][:120] if snippet.code else ''
-        use_path = bool(seed_name) and seed_name == filename_stem
         return GraphSeedQuery(
-            path=snippet.filename if use_path else '',
+            path=snippet.filename if seed_name else '',
             name=seed_name,
             signature=signature if seed_name else '',
             max_matches=3,
         )
+
+    def _build_graph_seed_queries(self, snippets: List[CandidateSnippet]) -> List[GraphSeedQuery]:
+        seeds: List[GraphSeedQuery] = []
+        seen: set[tuple[str, str, str]] = set()
+        for snippet in snippets:
+            primary = self._build_seed_query(snippet)
+            self._append_seed_query(seeds, seen, primary)
+            for call_seed in self._extract_call_seed_queries(snippet):
+                self._append_seed_query(seeds, seen, call_seed)
+        return seeds
+
+    def _extract_call_seed_queries(self, snippet: CandidateSnippet) -> List[GraphSeedQuery]:
+        call_names: List[str] = []
+        seen: set[str] = set()
+        for line in snippet.code.splitlines():
+            for call_name in self._extract_call_names(line):
+                lowered = call_name.lower()
+                if lowered in seen:
+                    continue
+                seen.add(lowered)
+                call_names.append(call_name)
+        return [
+            GraphSeedQuery(name=call_name, path='', signature='', max_matches=3)
+            for call_name in call_names
+        ]
+
+    def _extract_call_names(self, line: str) -> List[str]:
+        patterns = re.findall(r'([A-Za-z_][A-Za-z0-9_]*)\s*\(', line)
+        skip = {
+            'if', 'for', 'while', 'switch', 'catch', 'function', 'class'
+        }
+        result: List[str] = []
+        for name in patterns:
+            if name in skip:
+                continue
+            result.append(name)
+        return result
+
+    def _append_seed_query(
+        self,
+        seeds: List[GraphSeedQuery],
+        seen: set[tuple[str, str, str]],
+        seed: GraphSeedQuery,
+    ) -> None:
+        key = (seed.name, seed.path, seed.signature)
+        if key in seen or not any(key):
+            return
+        seen.add(key)
+        seeds.append(seed)
 
     def _find_fallback_snippet(
         self,
@@ -309,6 +354,7 @@ class WorkItemService:
         start_line: int | None,
         end_line: int | None,
         node_type: str,
+        node_name: str,
         fallback_snippet: str,
     ) -> str:
         if not relative_path or not job.snapshot.local_path:
@@ -323,8 +369,71 @@ class WorkItemService:
         if start_line and end_line and start_line > 0 and end_line >= start_line:
             excerpt_lines = lines[start_line - 1:min(end_line, len(lines))]
             return '\n'.join(excerpt_lines[:40]).strip()
+        inferred_excerpt = self._infer_symbol_excerpt(lines, node_type, node_name)
+        if inferred_excerpt:
+            return inferred_excerpt
         if fallback_snippet:
             return fallback_snippet
         if node_type == 'File':
             return ''
         return ''
+
+    def _infer_symbol_excerpt(
+        self,
+        lines: List[str],
+        node_type: str,
+        node_name: str,
+    ) -> str:
+        symbol_name = node_name.split('.')[-1] if node_name else ''
+        if not symbol_name:
+            return ''
+        if node_type == 'Function':
+            return self._extract_function_excerpt(lines, symbol_name)
+        if node_type == 'Class':
+            return self._extract_class_excerpt(lines, symbol_name)
+        return ''
+
+    def _extract_function_excerpt(self, lines: List[str], symbol_name: str) -> str:
+        if symbol_name.startswith('%'):
+            return ''
+        escaped_name = re.escape(symbol_name)
+        patterns = [
+            re.compile(rf'^\s*(?:export\s+)?(?:(?:public|private|protected)\s+)?(?:static\s+)?(?:async\s+)?{escaped_name}\s*\('),
+            re.compile(rf'^\s*(?:export\s+)?(?:async\s+)?function\s+{escaped_name}\s*\('),
+            re.compile(rf'^\s*{escaped_name}\s*:\s*(?:async\s+)?\('),
+        ]
+        if symbol_name == 'constructor':
+            patterns.insert(0, re.compile(r'^\s*constructor\s*\('))
+
+        for index, line in enumerate(lines):
+            stripped = line.strip()
+            if not stripped:
+                continue
+            if any(pattern.search(line) for pattern in patterns):
+                return self._collect_block_excerpt(lines, index)
+        return ''
+
+    def _extract_class_excerpt(self, lines: List[str], symbol_name: str) -> str:
+        if symbol_name.startswith('%'):
+            return ''
+        pattern = re.compile(rf'^\s*(?:export\s+)?class\s+{re.escape(symbol_name)}\b')
+        for index, line in enumerate(lines):
+            if pattern.search(line):
+                return self._collect_block_excerpt(lines, index)
+        return ''
+
+    def _collect_block_excerpt(self, lines: List[str], start_index: int) -> str:
+        excerpt: List[str] = []
+        brace_depth = 0
+        saw_open_brace = False
+        for line in lines[start_index:]:
+            excerpt.append(line)
+            brace_depth += line.count('{')
+            if line.count('{') > 0:
+                saw_open_brace = True
+            brace_depth -= line.count('}')
+            if saw_open_brace and brace_depth <= 0:
+                break
+            if len(excerpt) >= 40:
+                break
+        return '\n'.join(excerpt).strip()
