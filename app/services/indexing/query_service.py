@@ -1,4 +1,4 @@
-from collections import deque
+﻿from collections import deque
 from typing import Iterable
 from pathlib import Path
 
@@ -48,15 +48,15 @@ class GraphQueryService:
                 )
                 source = "neo4j"
             except ModuleNotFoundError:
-                hints.append("未安装 neo4j Python 驱动，图查询已回退到本地图工件。")
+                hints.append("??? neo4j Python ????????????????")
             except Exception as exc:
-                hints.append(f"Neo4j 图查询失败，已回退到本地图工件：{exc}")
+                hints.append(f"Neo4j ????????????????{exc}")
 
         if source != "neo4j":
             artifact = self._load_artifact(job)
             seed_matches, nodes, edges = self._query_artifact(artifact, request)
             if job.summary.graph_store_status != "loaded":
-                hints.append("当前结果来自本地图工件，尚未直接从 Neo4j 查询。")
+                hints.append("????????????????? Neo4j ???")
 
         paths = self._build_paths(
             seed_matches=seed_matches,
@@ -146,22 +146,30 @@ class GraphQueryService:
         return seed_matches, kept_nodes, kept_edge_list
 
     def _match_nodes(self, nodes: Iterable[GraphNode], seed: GraphSeedQuery) -> list[GraphNode]:
-        result: list[GraphNode] = []
+        scored_nodes: list[tuple[int, int, GraphNode]] = []
         normalized_path = seed.path.replace("\\", "/").lower()
         normalized_name = seed.name.lower()
         for node in nodes:
+            score = 0
             if seed.node_id and node.node_id == seed.node_id:
-                result.append(node)
-                continue
+                score += 1000
             if seed.path and node.path.lower() == normalized_path:
-                result.append(node)
-                continue
-            if seed.name and normalized_name in node.name.lower():
-                result.append(node)
-                continue
+                score += 80
+                score += self._path_match_type_bonus(node)
+            if seed.name:
+                node_name = node.name.lower()
+                if node_name == normalized_name or node_name.endswith(f'.{normalized_name}'):
+                    score += 320
+                elif normalized_name in node_name:
+                    score += 220
             if seed.signature and seed.signature in node.signature:
-                result.append(node)
-        return result[: seed.max_matches]
+                score += 260
+            if seed.path and seed.name and node.path.lower() == normalized_path and normalized_name in node.name.lower():
+                score += 180
+            if score > 0:
+                scored_nodes.append((score, self._node_type_rank(node), node))
+        scored_nodes.sort(key=lambda item: (item[0], item[1], len(item[2].name)), reverse=True)
+        return [node for _, _, node in scored_nodes[: seed.max_matches]]
 
     def _build_paths(
         self,
@@ -255,3 +263,22 @@ class GraphQueryService:
 
     def _edge_key(self, edge: GraphEdge) -> str:
         return f"{edge.edge_type}:{edge.source_id}:{edge.target_id}:{edge.detail}"
+
+    def _node_type_rank(self, node: GraphNode) -> int:
+        if node.node_type == 'Function':
+            return 3
+        if node.node_type == 'Class':
+            return 2
+        if node.node_type == 'File':
+            return 1
+        return 0
+
+    def _path_match_type_bonus(self, node: GraphNode) -> int:
+        if node.node_type == 'Function':
+            return 60
+        if node.node_type == 'Class':
+            return 40
+        if node.node_type == 'File':
+            return 10
+        return 0
+

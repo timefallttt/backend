@@ -148,6 +148,8 @@ class LlmRequestPreview(BaseModel):
     provider: str = "pending"
     model_name: str = "pending"
     summary: str
+    system_message: str = ""
+    user_message: str = ""
     request_body: dict = Field(default_factory=dict)
 
 

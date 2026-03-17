@@ -410,6 +410,7 @@ class ConsistencyService:
                     ],
                 )
                 graph_paths.append(graph_path)
+            graph_paths = self._sort_graph_paths_for_llm(graph_paths)
 
         return LlmEvidencePack(
             requirement_text=request.requirement_text,
@@ -435,14 +436,41 @@ class ConsistencyService:
         }
         return node_type_map.get(node_type, 'service')
 
+
+    def _sort_graph_paths_for_llm(self, paths: List[LlmEvidencePath]) -> List[LlmEvidencePath]:
+        def score(path: LlmEvidencePath) -> tuple[int, int, int]:
+            call_count = sum(1 for node in path.nodes if node.relation_from_prev == 'CALLS')
+            function_count = sum(1 for node in path.nodes if node.node_type == 'function')
+            file_count = sum(1 for node in path.nodes if node.node_type == 'file')
+            terminal = path.nodes[-1] if path.nodes else None
+            terminal_penalty = 0
+            if terminal and terminal.node_type == 'file':
+                terminal_penalty -= 8
+            if terminal and terminal.label.startswith('%'):
+                terminal_penalty -= 3
+            return (call_count * 20 + function_count * 6 - file_count * 2 + terminal_penalty, call_count, -len(path.nodes))
+
+        return sorted(paths, key=score, reverse=True)
+
     def _build_llm_request_preview(self, evidence_pack: LlmEvidencePack) -> LlmRequestPreview:
+        system_message = (
+            '你是需求实现审阅助手。请仅基于给定的原始证据进行判断，不要参考任何先验结论，'
+            '不要臆造未提供的实现。你需要对每条验收标准给出 '
+            'satisfied/partially_satisfied/not_satisfied 结论、可复核理由、'
+            '引用的证据片段和图路径，并指出是否需要人工复核。'
+        )
+        user_message = self._build_llm_user_message(evidence_pack)
         request_body = {
-            'system_prompt': (
-                '你是需求实现审阅助手。请仅基于给定的原始证据进行判断，不要参考任何先验结论，'
-                '不要臆造未提供的实现。你需要对每条需求要点给出 '
-                'satisfied/partially_satisfied/not_satisfied 结论、可复核理由、'
-                '引用的证据片段和图路径，并指出是否需要人工复核。'
-            ),
+            'messages': [
+                {
+                    'role': 'system',
+                    'content': system_message,
+                },
+                {
+                    'role': 'user',
+                    'content': user_message,
+                },
+            ],
             'task_context': {
                 'requirement_text': evidence_pack.requirement_text,
                 'acceptance_criteria': evidence_pack.acceptance_criteria,
@@ -489,8 +517,102 @@ class ConsistencyService:
                 '当前尚未实际调用大模型。请求体已整理为需求上下文与证据池，'
                 f'包含 {len(evidence_pack.snippets)} 个代码片段和 {len(evidence_pack.graph_paths)} 条图路径。'
             ),
+            system_message=system_message,
+            user_message=user_message,
             request_body=request_body,
         )
+
+    def _build_llm_user_message(self, evidence_pack: LlmEvidencePack) -> str:
+        lines: List[str] = []
+        lines.append('请基于下面的需求与原始证据，逐条审阅每条验收标准是否已被当前实现满足。')
+        lines.append('')
+        lines.append('一、需求描述')
+        lines.append(evidence_pack.requirement_text or '未提供。')
+        lines.append('')
+        lines.append('二、验收标准')
+        if evidence_pack.acceptance_criteria:
+            for index, item in enumerate(evidence_pack.acceptance_criteria, start=1):
+                lines.append(f'{index}. {item}')
+        else:
+            lines.append('未提供验收标准。')
+        lines.append('')
+        lines.append('三、代码片段证据')
+        if evidence_pack.snippets:
+            for snippet in evidence_pack.snippets:
+                lines.append(
+                    f'- 片段 {snippet.snippet_id} | {snippet.filename}:{snippet.start_line}-{snippet.end_line} | {snippet.reason}'
+                )
+                lines.append('```ts')
+                lines.append(snippet.code.strip())
+                lines.append('```')
+        else:
+            lines.append('未提供代码片段证据。')
+        lines.append('')
+        lines.append('四、图路径证据')
+        if evidence_pack.graph_paths:
+            selected_paths = self._select_graph_paths_for_prompt(evidence_pack.graph_paths)
+            seen_excerpt_nodes: set[str] = set()
+            for path in selected_paths:
+                lines.append(f'- 路径 {path.path_id}')
+                lines.append(f'  摘要：{self._render_graph_path_summary(path)}')
+                for node in path.nodes[:4]:
+                    node_header = f'  节点：{node.label} [{node.node_type}]'
+                    if node.path:
+                        node_header += f' @ {node.path}'
+                    if node.relation_from_prev:
+                        node_header += f' <{node.relation_from_prev}>'
+                    lines.append(node_header)
+                    excerpt = self._trim_excerpt(node.code_excerpt)
+                    if excerpt and node.node_id not in seen_excerpt_nodes:
+                        seen_excerpt_nodes.add(node.node_id)
+                        lines.append('  代码摘录：')
+                        lines.append('  ```ts')
+                        lines.extend([f'  {line}' for line in excerpt.splitlines()])
+                        lines.append('  ```')
+        else:
+            lines.append('未提供图路径证据。')
+        lines.append('')
+        lines.append('五、客观信号')
+        if evidence_pack.structural_gaps:
+            lines.append('结构信号：')
+            for signal in evidence_pack.structural_gaps:
+                lines.append(f'- {signal}')
+        if evidence_pack.tool_findings:
+            lines.append('工具信号：')
+            for finding in evidence_pack.tool_findings:
+                lines.append(f'- [{finding.level}] {finding.message}')
+        if not evidence_pack.structural_gaps and not evidence_pack.tool_findings:
+            lines.append('无额外客观信号。')
+        lines.append('')
+        lines.append('六、输出要求')
+        lines.append('请返回 JSON 对象，字段必须满足 output_contract。')
+        lines.append('你需要自己判断每条验收标准与哪些证据相关，不要假设系统已经完成证据归因。')
+        lines.append('如果证据不足，请明确说明证据不足，而不是猜测实现存在。')
+        return '\n'.join(lines)
+
+    def _render_graph_path_summary(self, path: LlmEvidencePath) -> str:
+        segments = []
+        for node in path.nodes[:6]:
+            label = node.label
+            if node.relation_from_prev:
+                segments.append(f'{node.relation_from_prev} -> {label}')
+            else:
+                segments.append(label)
+        return ' | '.join(segments)
+
+
+    def _select_graph_paths_for_prompt(self, paths: List[LlmEvidencePath]) -> List[LlmEvidencePath]:
+        call_paths = [path for path in paths if any(node.relation_from_prev == 'CALLS' for node in path.nodes)]
+        if call_paths:
+            return call_paths[:6]
+        return paths[:4]
+
+    def _trim_excerpt(self, code_excerpt: str) -> str:
+        if not code_excerpt:
+            return ''
+        lines = [line.rstrip() for line in code_excerpt.splitlines()]
+        cleaned = [line for line in lines if line.strip()]
+        return '\n'.join(cleaned[:12])
 
     def _parse_llm_response(
         self,
