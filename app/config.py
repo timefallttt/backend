@@ -21,3 +21,16 @@ NEO4J_URI = os.getenv('NEO4J_URI', 'bolt://localhost:7687').strip()
 NEO4J_USERNAME = os.getenv('NEO4J_USERNAME', 'neo4j').strip()
 NEO4J_PASSWORD = os.getenv('NEO4J_PASSWORD', '12345678').strip()
 NEO4J_DATABASE = os.getenv('NEO4J_DATABASE', 'neo4j').strip()
+
+EXTERNAL_WORKITEM_CONNECTOR_PATH = Path(
+    os.getenv('EXTERNAL_WORKITEM_CONNECTOR_PATH', PROJECT_ROOT / 'workitem_adapter' / 'connector.py')
+)
+EXTERNAL_WORKITEM_DATA_PATH = Path(
+    os.getenv('EXTERNAL_WORKITEM_DATA_PATH', PROJECT_ROOT / 'workitem_adapter' / 'sample_workitems.json')
+)
+
+LLM_REVIEW_PROVIDER = os.getenv('LLM_REVIEW_PROVIDER', 'pending').strip()
+LLM_REVIEW_API_URL = os.getenv('LLM_REVIEW_API_URL', '').strip()
+LLM_REVIEW_API_KEY = os.getenv('LLM_REVIEW_API_KEY', '').strip()
+LLM_REVIEW_MODEL_NAME = os.getenv('LLM_REVIEW_MODEL_NAME', 'pending').strip()
+LLM_REVIEW_TIMEOUT_SEC = int(os.getenv('LLM_REVIEW_TIMEOUT_SEC', '120'))

@@ -4,6 +4,7 @@ from app.services.consistency.runtime import consistency_service
 from app.services.consistency.schemas import (
     ConsistencyAnalyzeRequest,
     ConsistencyAnalyzeResponse,
+    LlmReviewExecuteRequest,
     ReviewDashboardResponse,
     ReviewFeedbackRequest,
     ReviewHistoryResponse,
@@ -64,6 +65,16 @@ async def delete_review_task(task_id: str) -> Response:
 async def analyze_review_task(task_id: str) -> ReviewTaskDetail:
     try:
         return consistency_service.analyze_task(task_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
+@router.post("/tasks/{task_id}/llm-review", response_model=ReviewTaskDetail)
+async def execute_llm_review(task_id: str, request: LlmReviewExecuteRequest) -> ReviewTaskDetail:
+    try:
+        return consistency_service.execute_llm_review(task_id, request)
     except ValueError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     except Exception as exc:

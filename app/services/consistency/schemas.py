@@ -3,10 +3,11 @@ from typing import List, Literal
 from pydantic import BaseModel, Field
 
 
-JudgementStatus = Literal["satisfied", "partially_satisfied", "not_satisfied"]
+JudgementStatus = Literal["satisfied", "partially_satisfied", "not_satisfied", "error"]
 TaskStatus = Literal["draft", "ready", "completed", "needs_review"]
 FeedbackDecision = Literal["agree", "question", "misjudged"]
 NodeType = Literal["requirement", "file", "class", "function", "constraint", "ui", "service"]
+LlmReviewVerdict = Literal["satisfied", "partially_satisfied", "not_satisfied", "error"]
 
 
 class CandidateSnippet(BaseModel):
@@ -133,20 +134,11 @@ class LlmEvidencePath(BaseModel):
     nodes: List[LlmEvidenceGraphNode] = Field(default_factory=list)
 
 
-class LlmEvidenceRequirementItem(BaseModel):
-    item: str
-    status_hint: JudgementStatus
-    snippet_ids: List[str] = Field(default_factory=list)
-    path_ids: List[str] = Field(default_factory=list)
-    negative_signals: List[str] = Field(default_factory=list)
-
-
 class LlmEvidencePack(BaseModel):
     requirement_text: str
     acceptance_criteria: List[str] = Field(default_factory=list)
     snippets: List[LlmEvidenceSnippet] = Field(default_factory=list)
     graph_paths: List[LlmEvidencePath] = Field(default_factory=list)
-    requirement_items: List[LlmEvidenceRequirementItem] = Field(default_factory=list)
     structural_gaps: List[str] = Field(default_factory=list)
     tool_findings: List[ToolFinding] = Field(default_factory=list)
 
@@ -157,6 +149,28 @@ class LlmRequestPreview(BaseModel):
     model_name: str = "pending"
     summary: str
     request_body: dict = Field(default_factory=dict)
+
+
+class LlmItemAssessment(BaseModel):
+    item: str
+    verdict: LlmReviewVerdict
+    reasoning: str = ""
+    supporting_snippet_ids: List[str] = Field(default_factory=list)
+    supporting_path_ids: List[str] = Field(default_factory=list)
+    manual_review_needed: bool = True
+
+
+class LlmReviewResult(BaseModel):
+    status: Literal["success", "error"]
+    provider: str = "pending"
+    model_name: str = "pending"
+    summary: str
+    overall_verdict: LlmReviewVerdict = "error"
+    manual_review_needed: bool = True
+    item_assessments: List[LlmItemAssessment] = Field(default_factory=list)
+    response_text: str = ""
+    response_body: dict = Field(default_factory=dict)
+    error_message: str = ""
 
 
 class ReviewReport(BaseModel):
@@ -172,6 +186,7 @@ class ReviewReport(BaseModel):
     review_focuses: List[str] = Field(default_factory=list)
     evidence_pack: LlmEvidencePack | None = None
     llm_request_preview: LlmRequestPreview | None = None
+    llm_result: LlmReviewResult | None = None
     summary: str
 
 
@@ -273,3 +288,10 @@ class ReviewFeedbackRequest(BaseModel):
     decision: FeedbackDecision
     comment: str = ""
     reviewer: str = Field(..., min_length=1)
+
+
+class LlmReviewExecuteRequest(BaseModel):
+    provider: str = ""
+    api_url: str = ""
+    api_key: str = ""
+    model_name: str = ""

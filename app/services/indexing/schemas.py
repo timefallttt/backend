@@ -1,4 +1,4 @@
-from typing import List, Literal
+﻿from typing import List, Literal
 
 from pydantic import BaseModel, Field, HttpUrl
 
@@ -10,7 +10,7 @@ IndexJobStatus = Literal[
     "completed_with_warnings",
     "failed",
 ]
-ParserMode = Literal["arkanalyzer", "placeholder"]
+ParserMode = Literal["arkanalyzer"]
 GraphStoreStatus = Literal["loaded", "pending_setup", "failed", "not_attempted"]
 NodeType = Literal["Repository", "File", "Class", "Function"]
 EdgeType = Literal["CONTAINS", "CALLS"]
@@ -143,3 +143,4 @@ class GraphEvidenceQueryResponse(BaseModel):
     paths: List[GraphEvidencePath] = Field(default_factory=list)
     summary: GraphEvidenceSummary = Field(default_factory=GraphEvidenceSummary)
     hints: List[str] = Field(default_factory=list)
+

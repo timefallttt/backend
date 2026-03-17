@@ -1,7 +1,10 @@
-﻿import re
+﻿import importlib.util
+import re
 from pathlib import Path
+from types import ModuleType
 from typing import Dict, List, Protocol
 
+from app.config import EXTERNAL_WORKITEM_CONNECTOR_PATH, EXTERNAL_WORKITEM_DATA_PATH
 from app.services.consistency.schemas import (
     CandidateSnippet,
     GraphEvidenceBundle,
@@ -15,7 +18,6 @@ from app.services.consistency.service import ConsistencyService
 from app.services.indexing.query_service import GraphQueryService
 from app.services.indexing.schemas import GraphEvidenceQueryRequest, GraphSeedQuery, IndexJobDetail
 from app.services.indexing.service import OfflineIndexingService
-from app.services.workitems.connectors.demo import DemoWorkItemConnector
 from app.services.workitems.schemas import (
     WorkItemCodeSeed,
     WorkItemConnectorListResponse,
@@ -37,6 +39,22 @@ class WorkItemConnector(Protocol):
     def get_item(self, item_id: str) -> WorkItemDetail: ...
 
 
+class ExternalModuleConnector:
+    def __init__(self, module: ModuleType) -> None:
+        self._module = module
+        self._summary = WorkItemConnectorSummary(**module.connector_summary())
+
+    @property
+    def summary(self) -> WorkItemConnectorSummary:
+        return self._summary
+
+    def list_items(self) -> List[WorkItemSummary]:
+        return [WorkItemSummary(**item) for item in self._module.list_items()]
+
+    def get_item(self, item_id: str) -> WorkItemDetail:
+        return WorkItemDetail(**self._module.get_item(item_id))
+
+
 class WorkItemService:
     def __init__(
         self,
@@ -47,9 +65,8 @@ class WorkItemService:
         self._indexing_service = indexing_service
         self._graph_query_service = graph_query_service
         self._consistency_service = consistency_service
-        self._connectors: Dict[str, WorkItemConnector] = {
-            DemoWorkItemConnector.key: DemoWorkItemConnector(),
-        }
+        self._connectors: Dict[str, WorkItemConnector] = {}
+        self._load_external_connector()
 
     def list_connectors(self) -> WorkItemConnectorListResponse:
         return WorkItemConnectorListResponse(
@@ -105,6 +122,28 @@ class WorkItemService:
             graph_evidence=graph_evidence,
         )
         return self._consistency_service.create_task(task)
+
+    def _load_external_connector(self) -> None:
+        connector_path = EXTERNAL_WORKITEM_CONNECTOR_PATH
+        if not connector_path.exists():
+            return
+
+        spec = importlib.util.spec_from_file_location('external_workitem_connector', connector_path)
+        if not spec or not spec.loader:
+            raise RuntimeError(f'无法加载外部工单接入器：{connector_path}')
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+
+        required_functions = ('connector_summary', 'list_items', 'get_item')
+        missing = [name for name in required_functions if not hasattr(module, name)]
+        if missing:
+            raise RuntimeError(f'外部工单接入器缺少必要函数：{", ".join(missing)}')
+
+        if hasattr(module, 'configure'):
+            module.configure(data_path=str(EXTERNAL_WORKITEM_DATA_PATH))
+
+        connector = ExternalModuleConnector(module)
+        self._connectors[connector.summary.connector_key] = connector
 
     def _get_connector(self, connector_key: str) -> WorkItemConnector:
         connector = self._connectors.get(connector_key)

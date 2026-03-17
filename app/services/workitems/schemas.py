@@ -3,7 +3,7 @@
 from pydantic import BaseModel, Field
 
 
-ConnectorMode = Literal['demo', 'custom']
+ConnectorMode = Literal['custom']
 DiffChangeType = Literal['added', 'modified', 'deleted', 'renamed']
 
 
@@ -11,7 +11,7 @@ class WorkItemConnectorSummary(BaseModel):
     connector_key: str
     name: str
     description: str
-    mode: ConnectorMode = 'demo'
+    mode: ConnectorMode = 'custom'
 
 
 class WorkItemCodeSeed(BaseModel):
@@ -93,3 +93,4 @@ class WorkItemImportRequest(BaseModel):
     repo_name: str = ''
     snapshot: str = ''
     auto_expand_graph_evidence: bool = True
+
