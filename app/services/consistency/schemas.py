@@ -4,7 +4,7 @@ from pydantic import BaseModel, Field
 
 
 JudgementStatus = Literal["satisfied", "partially_satisfied", "not_satisfied", "error"]
-TaskStatus = Literal["draft", "ready", "completed", "needs_review"]
+TaskStatus = Literal["draft", "ready", "reviewing", "completed", "needs_review"]
 FeedbackDecision = Literal["agree", "question", "misjudged"]
 NodeType = Literal["requirement", "file", "class", "function", "constraint", "ui", "service"]
 LlmReviewVerdict = Literal["satisfied", "partially_satisfied", "not_satisfied", "error"]
@@ -170,6 +170,10 @@ class LlmReviewResult(BaseModel):
     overall_verdict: LlmReviewVerdict = "error"
     manual_review_needed: bool = True
     item_assessments: List[LlmItemAssessment] = Field(default_factory=list)
+    missing_items: List[str] = Field(default_factory=list)
+    conflicts: List[str] = Field(default_factory=list)
+    overall_score_raw: float | None = Field(default=None, ge=0, le=1)
+    confidence: float | None = Field(default=None, ge=0, le=1)
     response_text: str = ""
     response_body: dict = Field(default_factory=dict)
     error_message: str = ""
@@ -178,10 +182,11 @@ class LlmReviewResult(BaseModel):
 class ReviewReport(BaseModel):
     overall_score: float = Field(..., ge=0, le=1)
     overall_confidence: float = Field(..., ge=0, le=1)
-    status: Literal["completed", "needs_review"]
+    status: Literal["reviewing", "completed", "needs_review"]
     requirement_spec: RequirementSpec
     judgements: List[ItemJudgement]
     missing_items: List[str] = Field(default_factory=list)
+    conflicts: List[str] = Field(default_factory=list)
     tool_findings: List[ToolFinding] = Field(default_factory=list)
     evidence_paths: List[EvidencePath] = Field(default_factory=list)
     structural_gaps: List[str] = Field(default_factory=list)
@@ -293,7 +298,4 @@ class ReviewFeedbackRequest(BaseModel):
 
 
 class LlmReviewExecuteRequest(BaseModel):
-    provider: str = ""
-    api_url: str = ""
-    api_key: str = ""
-    model_name: str = ""
+    pass

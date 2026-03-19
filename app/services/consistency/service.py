@@ -5,7 +5,11 @@ from datetime import datetime
 from typing import Dict, List
 from uuid import uuid4
 
-from app.config import REVIEW_TASKS_FILE
+from app.config import (
+    LLM_REVIEW_MODEL_NAME,
+    LLM_REVIEW_PROVIDER,
+    REVIEW_TASKS_FILE,
+)
 
 from .llm_gateway import LlmReviewGateway
 from .schemas import (
@@ -161,21 +165,76 @@ class ConsistencyService:
             report = ReviewReport(**task['report']) if task.get('report') else None
             if not report or not report.llm_request_preview:
                 raise ValueError('task does not have an LLM request preview')
+            if report.status == 'reviewing':
+                return self._build_task_detail(task)
 
-            gateway_response = self._llm_gateway.submit_review(
-                report.llm_request_preview,
-                provider=request.provider,
-                api_url=request.api_url,
-                api_key=request.api_key,
-                model_name=request.model_name,
+            updated_report = report.model_copy(
+                update={
+                    'status': 'reviewing',
+                    'summary': 'LLM 审阅进行中，请稍候刷新结果。',
+                }
             )
+            task['report'] = updated_report.model_dump()
+            task['updated_at'] = self._now()
+            task['history'].insert(
+                0,
+                {
+                    'record_id': f'hist-{uuid4().hex[:8]}',
+                    'label': '发起 LLM 审阅',
+                    'status': updated_report.status,
+                    'overall_score': updated_report.overall_score,
+                    'summary': updated_report.summary,
+                    'changed_points': ['已提交到后端执行，等待 LLM 返回结果'],
+                    'created_at': task['updated_at'],
+                },
+            )
+            self._save_tasks()
+            task_detail = self._build_task_detail(task)
+
+        threading.Thread(
+            target=self._execute_llm_review_background,
+            args=(task_id,),
+            daemon=True,
+        ).start()
+        return task_detail
+
+    def _execute_llm_review_background(self, task_id: str) -> None:
+        with self._lock:
+            task = self._tasks.get(task_id)
+            if not task:
+                return
+            report = ReviewReport(**task['report']) if task.get('report') else None
+            if not report or not report.llm_request_preview:
+                return
+            preview = report.llm_request_preview.model_copy(deep=True)
+            requirement_text = task['requirement_text']
+            acceptance_criteria = list(task['acceptance_criteria'])
+
+        try:
+            gateway_response = self._llm_gateway.submit_review(preview)
             llm_result = self._parse_llm_response(
                 gateway_response.response_text,
                 provider=gateway_response.provider,
                 model_name=gateway_response.model_name,
-                requirement_items=self._build_requirement_items(task['requirement_text'], task['acceptance_criteria']),
+                requirement_items=self._build_requirement_items(requirement_text, acceptance_criteria),
                 error_message=gateway_response.error_message,
             )
+        except Exception as exc:
+            llm_result = self._build_llm_error_result(
+                provider=LLM_REVIEW_PROVIDER or 'bigmodel',
+                model_name=LLM_REVIEW_MODEL_NAME or 'glm-4.7-flash',
+                requirement_items=self._build_requirement_items(requirement_text, acceptance_criteria),
+                response_text='',
+                error_message=f'LLM 后台审阅执行失败：{exc}',
+            )
+
+        with self._lock:
+            task = self._tasks.get(task_id)
+            if not task:
+                return
+            report = ReviewReport(**task['report']) if task.get('report') else None
+            if not report:
+                return
             updated_report = self._apply_llm_result(report, llm_result)
             task['report'] = updated_report.model_dump()
             task['updated_at'] = self._now()
@@ -183,7 +242,7 @@ class ConsistencyService:
                 0,
                 {
                     'record_id': f'hist-{uuid4().hex[:8]}',
-                    'label': '执行 LLM 审阅',
+                    'label': 'LLM 审阅完成' if llm_result.status == 'success' else 'LLM 审阅失败',
                     'status': updated_report.status,
                     'overall_score': updated_report.overall_score,
                     'summary': updated_report.summary,
@@ -192,7 +251,6 @@ class ConsistencyService:
                 },
             )
             self._save_tasks()
-            return self._build_task_detail(task)
 
     def get_history(self, task_id: str) -> ReviewHistoryResponse:
         task = self._get_task_or_raise(task_id)
@@ -525,6 +583,10 @@ class ConsistencyService:
                     'manual_review_needed',
                     'item_assessments',
                 ],
+                'optional_fields': [
+                    'missing_items',
+                    'confidence',
+                ],
                 'item_assessment_fields': [
                     'item',
                     'verdict',
@@ -536,6 +598,8 @@ class ConsistencyService:
             },
         }
         return LlmRequestPreview(
+            provider=LLM_REVIEW_PROVIDER or 'bigmodel',
+            model_name=LLM_REVIEW_MODEL_NAME or 'glm-4.7-flash',
             summary=(
                 '当前尚未实际调用大模型。请求体已整理为需求上下文与证据池，'
                 f'包含 {len(evidence_pack.snippets)} 个代码片段和 {len(evidence_pack.graph_paths)} 条图路径。'
@@ -615,8 +679,12 @@ class ConsistencyService:
         lines.append('六、输出要求')
         lines.append('请返回 JSON 对象，字段必须满足 output_contract。')
         lines.append('顶层字段必须包含：summary, overall_verdict, manual_review_needed, item_assessments。')
+        lines.append('可选但推荐返回：missing_items, confidence。')
         lines.append('item_assessments 中每一项必须包含：item, verdict, reasoning, supporting_snippet_ids, supporting_path_ids, manual_review_needed。')
         lines.append('overall_verdict 和 verdict 只允许使用：satisfied, partially_satisfied, not_satisfied。')
+        lines.append('不要使用 Markdown 代码块，不要额外包裹 answer、data、result 等外层字段，直接返回目标 JSON 对象本身。')
+        lines.append('字段名必须严格一致，不要改写成 item_id、status、items、analysis 等其他名字。')
+        lines.append('返回格式示例：{"summary":"...","overall_verdict":"partially_satisfied","manual_review_needed":true,"item_assessments":[{"item":"验收标准原文","verdict":"satisfied","reasoning":"...","supporting_snippet_ids":["snippet-1"],"supporting_path_ids":["path-1"],"manual_review_needed":false}],"missing_items":["..."],"confidence":0.82}')
         lines.append('你需要自己判断每条验收标准与哪些证据相关，不要假设系统已经完成证据归因。')
         lines.append('如果证据不足，请明确说明证据不足，而不是猜测实现存在。')
         return '\n'.join(lines)
@@ -720,7 +788,7 @@ class ConsistencyService:
             )
 
         try:
-            payload = json.loads(response_text)
+            payload = self._load_llm_json_payload(response_text)
         except Exception as exc:
             return self._build_llm_error_result(
                 provider=provider,
@@ -735,10 +803,22 @@ class ConsistencyService:
             overall_verdict = str(payload['overall_verdict']).strip()
             manual_review_needed = bool(payload['manual_review_needed'])
             raw_assessments = payload['item_assessments']
+            missing_items = [str(item) for item in payload.get('missing_items', [])]
+            conflicts = [str(item) for item in payload.get('conflicts', [])]
+            overall_score_raw = payload.get('overall_score_raw')
+            confidence = payload.get('confidence')
             if overall_verdict not in {'satisfied', 'partially_satisfied', 'not_satisfied'}:
                 raise ValueError('overall_verdict 不在允许范围内')
             if not isinstance(raw_assessments, list):
                 raise ValueError('item_assessments 必须为数组')
+            if overall_score_raw is not None:
+                overall_score_raw = float(overall_score_raw)
+                if not 0 <= overall_score_raw <= 1:
+                    raise ValueError('overall_score_raw 不在允许范围内')
+            if confidence is not None:
+                confidence = float(confidence)
+                if not 0 <= confidence <= 1:
+                    raise ValueError('confidence 不在允许范围内')
 
             item_assessments = [
                 LlmItemAssessment(
@@ -763,6 +843,10 @@ class ConsistencyService:
                 overall_verdict=overall_verdict,
                 manual_review_needed=manual_review_needed,
                 item_assessments=item_assessments,
+                missing_items=missing_items,
+                conflicts=conflicts,
+                overall_score_raw=overall_score_raw,
+                confidence=confidence,
                 response_text=response_text,
                 response_body=payload if isinstance(payload, dict) else {},
                 error_message='',
@@ -775,6 +859,37 @@ class ConsistencyService:
                 response_text=response_text,
                 error_message=f'LLM 返回结果结构不符合约定：{exc}',
             )
+
+    def _load_llm_json_payload(self, response_text: str) -> dict:
+        normalized = response_text.strip()
+        if normalized.startswith('```'):
+            fenced_match = re.search(r'```(?:json)?\s*(.*?)```', normalized, flags=re.S)
+            if fenced_match:
+                normalized = fenced_match.group(1).strip()
+
+        payload = json.loads(normalized)
+        if not isinstance(payload, dict):
+            raise ValueError('LLM 返回结果顶层必须为 JSON 对象')
+
+        if self._looks_like_review_payload(payload):
+            return payload
+
+        for key in ('answer', 'data', 'result', 'output'):
+            nested = payload.get(key)
+            if isinstance(nested, str):
+                nested_text = nested.strip()
+                if nested_text.startswith('{'):
+                    nested_payload = json.loads(nested_text)
+                    if isinstance(nested_payload, dict) and self._looks_like_review_payload(nested_payload):
+                        return nested_payload
+            if isinstance(nested, dict) and self._looks_like_review_payload(nested):
+                return nested
+
+        return payload
+
+    def _looks_like_review_payload(self, payload: dict) -> bool:
+        required_keys = {'summary', 'overall_verdict', 'manual_review_needed', 'item_assessments'}
+        return required_keys.issubset(payload.keys())
 
     def _build_llm_error_result(
         self,
@@ -849,16 +964,20 @@ class ConsistencyService:
             )
 
         success_scores = [item['score'] for item in judgements if item['status'] != 'error']
-        overall_score = round(sum(success_scores) / len(success_scores), 3) if success_scores else 0.0
+        fallback_score = round(sum(success_scores) / len(success_scores), 3) if success_scores else 0.0
+        overall_score = llm_result.overall_score_raw if llm_result.overall_score_raw is not None else fallback_score
+        overall_confidence = llm_result.confidence if llm_result.confidence is not None else 0.0
         status = 'completed' if llm_result.status == 'success' else 'needs_review'
         summary = llm_result.summary
 
         return report.model_copy(
             update={
                 'overall_score': overall_score,
-                'overall_confidence': 0.0,
+                'overall_confidence': overall_confidence,
                 'status': status,
                 'judgements': judgements,
+                'missing_items': llm_result.missing_items,
+                'conflicts': llm_result.conflicts,
                 'llm_result': llm_result,
                 'summary': summary,
             }

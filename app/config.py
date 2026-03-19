@@ -29,8 +29,8 @@ EXTERNAL_WORKITEM_DATA_PATH = Path(
     os.getenv('EXTERNAL_WORKITEM_DATA_PATH', PROJECT_ROOT / 'workitem_adapter' / 'sample_workitems.json')
 )
 
-LLM_REVIEW_PROVIDER = os.getenv('LLM_REVIEW_PROVIDER', 'pending').strip()
-LLM_REVIEW_API_URL = os.getenv('LLM_REVIEW_API_URL', '').strip()
-LLM_REVIEW_API_KEY = os.getenv('LLM_REVIEW_API_KEY', '').strip()
-LLM_REVIEW_MODEL_NAME = os.getenv('LLM_REVIEW_MODEL_NAME', 'pending').strip()
+LLM_REVIEW_PROVIDER = os.getenv('LLM_REVIEW_PROVIDER', 'bigmodel').strip()
+LLM_REVIEW_API_URL = os.getenv('LLM_REVIEW_API_URL', 'https://open.bigmodel.cn/api/paas/v4/chat/completions').strip()
+LLM_REVIEW_API_KEY = os.getenv('LLM_REVIEW_API_KEY', '2d79da0ff405413fb3f4c10ffe9c6337.aMezyuvmjffZjfY7').strip()
+LLM_REVIEW_MODEL_NAME = os.getenv('LLM_REVIEW_MODEL_NAME', 'glm-4.7-flash').strip()
 LLM_REVIEW_TIMEOUT_SEC = int(os.getenv('LLM_REVIEW_TIMEOUT_SEC', '120'))
