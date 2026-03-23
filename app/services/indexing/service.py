@@ -37,6 +37,7 @@ class OfflineIndexingService:
         self._jobs: Dict[str, dict] = {}
         self._ensure_storage()
         self._load_jobs()
+        self._cleanup_orphaned_storage()
 
     def list_jobs(self) -> IndexJobListResponse:
         jobs = [self._build_summary(job) for job in self._jobs.values()]
@@ -53,7 +54,7 @@ class OfflineIndexingService:
         job_id = f'index-{uuid4().hex[:8]}'
         artifact_dir = ARTIFACT_STORAGE_DIR / job_id
         artifact_dir.mkdir(parents=True, exist_ok=True)
-        repo_dir = REPO_STORAGE_DIR / repo_name
+        repo_dir = REPO_STORAGE_DIR / f'{repo_name}__{job_id}'
 
         job = {
             'job_id': job_id,
@@ -154,12 +155,16 @@ class OfflineIndexingService:
     def delete_job(self, job_id: str) -> None:
         with self._lock:
             job = self._get_job_or_raise(job_id)
+            if job['status'] in {'queued', 'running'}:
+                raise ValueError('cannot delete a queued or running indexing job')
             snapshot = RepoSnapshot(**job['snapshot'])
             snapshot_id = f"{snapshot.repo_name}@{snapshot.commit_hash or snapshot.branch}"
             artifact_dir = Path(job['artifact_dir'])
             repo_dir = Path(snapshot.local_path) if snapshot.local_path else None
 
-            self._graph_store.delete_snapshot(snapshot_id)
+            deleted, hints = self._graph_store.delete_snapshot(snapshot_id)
+            if hints:
+                job['setup_hints'] = self._merge_hints(job.get('setup_hints', []), hints)
             del self._jobs[job_id]
             self._save_jobs()
 
@@ -167,6 +172,9 @@ class OfflineIndexingService:
             shutil.rmtree(artifact_dir, ignore_errors=True)
         if repo_dir and repo_dir.exists() and not self._is_repo_path_referenced(str(repo_dir)):
             shutil.rmtree(repo_dir, ignore_errors=True)
+        self._cleanup_orphaned_storage()
+        if hints and not deleted:
+            raise RuntimeError('\n'.join(hints))
 
     def _run_parser(
         self,
@@ -398,6 +406,25 @@ class OfflineIndexingService:
             item.get('snapshot', {}).get('local_path') == repo_path
             for item in self._jobs.values()
         )
+
+    def _cleanup_orphaned_storage(self) -> None:
+        referenced_artifacts = {
+            Path(item['artifact_dir']).resolve()
+            for item in self._jobs.values()
+            if item.get('artifact_dir')
+        }
+        for artifact_dir in ARTIFACT_STORAGE_DIR.iterdir():
+            if artifact_dir.resolve() not in referenced_artifacts:
+                shutil.rmtree(artifact_dir, ignore_errors=True)
+
+        referenced_repos = {
+            Path(item.get('snapshot', {}).get('local_path', '')).resolve()
+            for item in self._jobs.values()
+            if item.get('snapshot', {}).get('local_path')
+        }
+        for repo_dir in REPO_STORAGE_DIR.iterdir():
+            if repo_dir.resolve() not in referenced_repos:
+                shutil.rmtree(repo_dir, ignore_errors=True)
 
     def _now(self) -> str:
         return datetime.now().replace(microsecond=0).isoformat()

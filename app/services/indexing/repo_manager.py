@@ -1,4 +1,5 @@
 import re
+import shutil
 import subprocess
 from pathlib import Path
 
@@ -8,7 +9,8 @@ class GitRepoManager:
         target_dir.parent.mkdir(parents=True, exist_ok=True)
         effective_branch = branch
 
-        if not target_dir.exists():
+        if not self._is_managed_repo_dir(target_dir, repo_url):
+            self._reset_target_dir(target_dir)
             try:
                 self._clone_repo(repo_url, effective_branch, target_dir)
             except RuntimeError:
@@ -86,6 +88,43 @@ class GitRepoManager:
         self._run(["git", "-C", str(target_dir), "fetch", "origin", branch, "--depth", "1"])
         self._run(["git", "-C", str(target_dir), "checkout", branch])
         self._run(["git", "-C", str(target_dir), "reset", "--hard", f"origin/{branch}"])
+
+    def _is_managed_repo_dir(self, target_dir: Path, repo_url: str) -> bool:
+        if not target_dir.exists() or not target_dir.is_dir():
+            return False
+        top_level = self._git_toplevel(target_dir)
+        if not top_level:
+            return False
+        if top_level.resolve() != target_dir.resolve():
+            return False
+        origin_url = self._git_origin_url(target_dir)
+        if not origin_url:
+            return False
+        return self._normalize_repo_url(origin_url) == self._normalize_repo_url(repo_url)
+
+    def _git_toplevel(self, target_dir: Path) -> Path | None:
+        try:
+            output = self._run(["git", "-C", str(target_dir), "rev-parse", "--show-toplevel"]).strip()
+        except RuntimeError:
+            return None
+        if not output:
+            return None
+        return Path(output)
+
+    def _git_origin_url(self, target_dir: Path) -> str:
+        try:
+            return self._run(["git", "-C", str(target_dir), "remote", "get-url", "origin"]).strip()
+        except RuntimeError:
+            return ""
+
+    def _normalize_repo_url(self, repo_url: str) -> str:
+        normalized = repo_url.strip().replace("\\", "/").rstrip("/")
+        normalized = re.sub(r"\.git$", "", normalized, flags=re.IGNORECASE)
+        return normalized.lower()
+
+    def _reset_target_dir(self, target_dir: Path) -> None:
+        if target_dir.exists():
+            shutil.rmtree(target_dir, ignore_errors=True)
 
     def _run(self, command: list[str]) -> str:
         try:

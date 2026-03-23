@@ -60,7 +60,8 @@ async def delete_index_job(job_id: str) -> Response:
         indexing_service.delete_job(job_id)
         return Response(status_code=204)
     except ValueError as exc:
-        raise HTTPException(status_code=404, detail=str(exc)) from exc
+        status_code = 404 if "not found" in str(exc) else 400
+        raise HTTPException(status_code=status_code, detail=str(exc)) from exc
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
