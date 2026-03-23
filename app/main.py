@@ -5,9 +5,14 @@ if __package__ in {None, ""}:
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from fastapi import FastAPI
+from pydantic import BaseModel
 from fastapi.middleware.cors import CORSMiddleware
 from app.api import router as api_router
-from app.data_models import Status
+
+
+class Status(BaseModel):
+    status: str
+    message: str
 
 app = FastAPI(
     title="ArkTS Code AR Backend API",

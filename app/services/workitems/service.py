@@ -175,20 +175,18 @@ class WorkItemService:
                 if not relevant_hunks:
                     continue
                 for index, hunk in enumerate(relevant_hunks, start=1):
-                    snippet_lines = self._build_snippet_lines(hunk)
-                    if not snippet_lines:
-                        continue
-                    seeds.append(
-                        WorkItemCodeSeed(
-                            seed_id=f'{commit.commit_id}-{file_diff.diff_id}-{index}',
-                            filename=file_diff.filename,
-                            code='\n'.join(snippet_lines),
-                            start_line=hunk.start_line,
-                            end_line=max(hunk.end_line, hunk.start_line + len(snippet_lines) - 1),
-                            recall_reason=f'由 commit {short_hash} 的 diff 片段派生',
-                            source='workitem_diff',
+                    for segment_index, segment in enumerate(self._build_hunk_seed_segments(hunk), start=1):
+                        seeds.append(
+                            WorkItemCodeSeed(
+                                seed_id=f'{commit.commit_id}-{file_diff.diff_id}-{index}-{segment_index}',
+                                filename=file_diff.filename,
+                                code=segment['code'],
+                                start_line=segment['start_line'],
+                                end_line=segment['end_line'],
+                                recall_reason=f'由 commit {short_hash} 的 diff {segment["kind"]}派生',
+                                source='workitem_diff',
+                            )
                         )
-                    )
         return seeds
 
     def _build_snippet_lines(self, hunk: WorkItemDiffHunk) -> List[str]:
@@ -196,6 +194,115 @@ class WorkItemService:
         if added:
             return added[:12]
         return [line for line in hunk.context_lines if line.strip()][:12]
+
+    def _build_hunk_seed_segments(self, hunk: WorkItemDiffHunk) -> List[dict]:
+        indexed_lines = self._build_indexed_hunk_lines(hunk)
+        if not indexed_lines:
+            return []
+
+        segments: List[dict] = []
+        consumed_indexes: set[int] = set()
+        cursor = 0
+
+        while cursor < len(indexed_lines):
+            line_no, line = indexed_lines[cursor]
+            if not self._looks_like_named_function_signature(line):
+                cursor += 1
+                continue
+
+            block_end = self._find_function_block_end(indexed_lines, cursor)
+            excerpt = indexed_lines[cursor:block_end + 1]
+            code_lines = [item[1] for item in excerpt]
+            if code_lines:
+                segments.append(
+                    {
+                        'kind': '函数体片段',
+                        'code': '\n'.join(code_lines).strip(),
+                        'start_line': line_no,
+                        'end_line': excerpt[-1][0],
+                    }
+                )
+                consumed_indexes.update(range(cursor, block_end + 1))
+            cursor = block_end + 1
+
+        fallback_chunks = self._build_behavior_chunks(indexed_lines, consumed_indexes)
+        segments.extend(fallback_chunks)
+        return [segment for segment in segments if segment.get('code')]
+
+    def _build_indexed_hunk_lines(self, hunk: WorkItemDiffHunk) -> List[tuple[int, str]]:
+        source_lines = hunk.added_lines if any(line.strip() for line in hunk.added_lines) else hunk.context_lines
+        indexed: List[tuple[int, str]] = []
+        for offset, line in enumerate(source_lines):
+            if not line.strip():
+                continue
+            indexed.append((hunk.start_line + offset, line))
+        return indexed
+
+    def _looks_like_named_function_signature(self, line: str) -> bool:
+        return bool(self._extract_named_function_signature_name(line))
+
+    def _extract_named_function_signature_name(self, line: str) -> str:
+        stripped = line.strip()
+        patterns = [
+            r'^(?:export\s+)?(?:public\s+|private\s+|protected\s+)?(?:static\s+)?(?:async\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*\([^;]*\)\s*(?::\s*[^=]+)?\s*\{?$',
+            r'^(?:export\s+)?(?:async\s+)?function\s+([A-Za-z_][A-Za-z0-9_]*)\s*\([^;]*\)\s*(?::\s*[^=]+)?\s*\{?$',
+            r'^(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*:\s*(?:async\s+)?\([^;]*\)\s*=>?\s*\{?$',
+        ]
+        for pattern in patterns:
+            match = re.search(pattern, stripped)
+            if match:
+                return match.group(1)
+        return ''
+
+    def _find_function_block_end(self, indexed_lines: List[tuple[int, str]], start_index: int) -> int:
+        brace_depth = 0
+        saw_open_brace = False
+        for index in range(start_index, len(indexed_lines)):
+            line = indexed_lines[index][1]
+            open_count = line.count('{')
+            close_count = line.count('}')
+            if open_count:
+                saw_open_brace = True
+            brace_depth += open_count
+            brace_depth -= close_count
+            if saw_open_brace and brace_depth <= 0:
+                return index
+        return min(len(indexed_lines) - 1, start_index + 11)
+
+    def _build_behavior_chunks(
+        self,
+        indexed_lines: List[tuple[int, str]],
+        consumed_indexes: set[int],
+    ) -> List[dict]:
+        chunks: List[List[tuple[int, str]]] = []
+        current: List[tuple[int, str]] = []
+
+        for index, item in enumerate(indexed_lines):
+            if index in consumed_indexes:
+                if current:
+                    chunks.append(current)
+                    current = []
+                continue
+            current.append(item)
+
+        if current:
+            chunks.append(current)
+
+        segments: List[dict] = []
+        for chunk in chunks:
+            code_lines = [line for _, line in chunk if line.strip()]
+            if not code_lines:
+                continue
+            selected = code_lines[:12]
+            segments.append(
+                {
+                    'kind': '行为片段',
+                    'code': '\n'.join(selected).strip(),
+                    'start_line': chunk[0][0],
+                    'end_line': chunk[min(len(chunk), len(selected)) - 1][0],
+                }
+            )
+        return segments
 
     def _expand_graph_evidence(
         self,
@@ -253,9 +360,10 @@ class WorkItemService:
 
     def _guess_seed_name(self, snippet: CandidateSnippet) -> str:
         first_line = snippet.code.splitlines()[0].strip() if snippet.code else ''
+        named_function = self._extract_named_function_signature_name(first_line)
+        if named_function:
+            return named_function
         patterns = [
-            r'^(?:export\s+)?(?:public\s+|private\s+|protected\s+)?(?:static\s+)?(?:async\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*\(',
-            r'^(?:export\s+)?(?:async\s+)?function\s+([A-Za-z_][A-Za-z0-9_]*)\s*\(',
             r'^(?:export\s+)?class\s+([A-Za-z_][A-Za-z0-9_]*)\b',
         ]
         for pattern in patterns:
@@ -288,6 +396,8 @@ class WorkItemService:
         call_names: List[str] = []
         seen: set[str] = set()
         for line in snippet.code.splitlines():
+            if self._looks_like_named_function_signature(line):
+                continue
             for call_name in self._extract_call_names(line):
                 lowered = call_name.lower()
                 if lowered in seen:
