@@ -1,6 +1,8 @@
 ﻿import hashlib
 import json
+import os
 import shutil
+import stat
 import threading
 from datetime import datetime
 from pathlib import Path
@@ -153,28 +155,30 @@ class OfflineIndexingService:
         return self._build_detail(job)
 
     def delete_job(self, job_id: str) -> None:
+        delete_hints: List[str] = []
         with self._lock:
             job = self._get_job_or_raise(job_id)
             if job['status'] in {'queued', 'running'}:
                 raise ValueError('cannot delete a queued or running indexing job')
             snapshot = RepoSnapshot(**job['snapshot'])
-            snapshot_id = f"{snapshot.repo_name}@{snapshot.commit_hash or snapshot.branch}"
+            snapshot_ref = snapshot.commit_hash or snapshot.branch
+            snapshot_id = f"{snapshot.repo_name}@{snapshot_ref}"
             artifact_dir = Path(job['artifact_dir'])
             repo_dir = Path(snapshot.local_path) if snapshot.local_path else None
 
             deleted, hints = self._graph_store.delete_snapshot(snapshot_id)
             if hints:
-                job['setup_hints'] = self._merge_hints(job.get('setup_hints', []), hints)
+                delete_hints = self._merge_hints(delete_hints, hints)
             del self._jobs[job_id]
             self._save_jobs()
 
         if artifact_dir.exists():
-            shutil.rmtree(artifact_dir, ignore_errors=True)
+            self._remove_tree(artifact_dir)
         if repo_dir and repo_dir.exists() and not self._is_repo_path_referenced(str(repo_dir)):
-            shutil.rmtree(repo_dir, ignore_errors=True)
+            self._remove_tree(repo_dir)
+        if not self._is_review_scope_referenced(snapshot.repo_name, snapshot_ref):
+            self._delete_linked_review_tasks(snapshot.repo_name, snapshot_ref)
         self._cleanup_orphaned_storage()
-        if hints and not deleted:
-            raise RuntimeError('\n'.join(hints))
 
     def _run_parser(
         self,
@@ -407,6 +411,13 @@ class OfflineIndexingService:
             for item in self._jobs.values()
         )
 
+    def _is_review_scope_referenced(self, repo_name: str, snapshot_ref: str) -> bool:
+        return any(
+            item.get('repo_name') == repo_name
+            and (item.get('snapshot', {}).get('commit_hash') or item.get('snapshot', {}).get('branch')) == snapshot_ref
+            for item in self._jobs.values()
+        )
+
     def _cleanup_orphaned_storage(self) -> None:
         referenced_artifacts = {
             Path(item['artifact_dir']).resolve()
@@ -415,7 +426,7 @@ class OfflineIndexingService:
         }
         for artifact_dir in ARTIFACT_STORAGE_DIR.iterdir():
             if artifact_dir.resolve() not in referenced_artifacts:
-                shutil.rmtree(artifact_dir, ignore_errors=True)
+                self._remove_tree(artifact_dir)
 
         referenced_repos = {
             Path(item.get('snapshot', {}).get('local_path', '')).resolve()
@@ -424,7 +435,27 @@ class OfflineIndexingService:
         }
         for repo_dir in REPO_STORAGE_DIR.iterdir():
             if repo_dir.resolve() not in referenced_repos:
-                shutil.rmtree(repo_dir, ignore_errors=True)
+                self._remove_tree(repo_dir)
+
+    def _delete_linked_review_tasks(self, repo_name: str, snapshot_ref: str) -> None:
+        from app.services.consistency.runtime import consistency_service
+
+        consistency_service.delete_tasks_by_scope(repo_name, snapshot_ref)
+
+    def _remove_tree(self, target_dir: Path) -> None:
+        if not target_dir.exists():
+            return
+
+        def onerror(func, path, exc_info):
+            try:
+                os.chmod(path, stat.S_IWRITE)
+                func(path)
+            except Exception:
+                pass
+
+        shutil.rmtree(target_dir, onerror=onerror)
+        if target_dir.exists():
+            raise RuntimeError(f'failed to remove directory: {target_dir}')
 
     def _now(self) -> str:
         return datetime.now().replace(microsecond=0).isoformat()

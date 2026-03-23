@@ -1,5 +1,7 @@
+import os
 import re
 import shutil
+import stat
 import subprocess
 from pathlib import Path
 
@@ -123,8 +125,19 @@ class GitRepoManager:
         return normalized.lower()
 
     def _reset_target_dir(self, target_dir: Path) -> None:
+        if not target_dir.exists():
+            return
+
+        def onerror(func, path, exc_info):
+            try:
+                os.chmod(path, stat.S_IWRITE)
+                func(path)
+            except Exception:
+                pass
+
+        shutil.rmtree(target_dir, onerror=onerror)
         if target_dir.exists():
-            shutil.rmtree(target_dir, ignore_errors=True)
+            raise RuntimeError(f'failed to remove directory: {target_dir}')
 
     def _run(self, command: list[str]) -> str:
         try:

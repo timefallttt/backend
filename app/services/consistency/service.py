@@ -84,6 +84,20 @@ class ConsistencyService:
             del self._tasks[task_id]
             self._save_tasks()
 
+    def delete_tasks_by_scope(self, repo_name: str, snapshot: str) -> int:
+        with self._lock:
+            target_ids = [
+                task_id
+                for task_id, task in self._tasks.items()
+                if task.get('repo_name') == repo_name and task.get('snapshot') == snapshot
+            ]
+            if not target_ids:
+                return 0
+            for task_id in target_ids:
+                del self._tasks[task_id]
+            self._save_tasks()
+            return len(target_ids)
+
     def create_task(self, request: ReviewTaskCreateRequest) -> ReviewTaskDetail:
         now = self._now()
         task_id = f'task-{uuid4().hex[:8]}'
