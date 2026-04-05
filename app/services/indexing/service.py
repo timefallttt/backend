@@ -50,6 +50,20 @@ class OfflineIndexingService:
         job = self._get_job_or_raise(job_id)
         return self._build_detail(job)
 
+    def find_job_by_scope(self, repo_name: str, snapshot_ref: str) -> IndexJobDetail | None:
+        if not repo_name or not snapshot_ref:
+            return None
+        candidates = [
+            job for job in self._jobs.values()
+            if job.get('repo_name') == repo_name
+            and (job.get('snapshot', {}).get('commit_hash') or job.get('snapshot', {}).get('branch')) == snapshot_ref
+            and job.get('status') in {'completed', 'completed_with_warnings'}
+        ]
+        if not candidates:
+            return None
+        candidates.sort(key=lambda item: item.get('updated_at', ''), reverse=True)
+        return self._build_detail(candidates[0])
+
     def create_job(self, request: RepositoryIndexRequest) -> IndexJobDetail:
         repo_name = request.repo_name or self._repo_manager.repo_slug(str(request.repo_url))
         now = self._now()

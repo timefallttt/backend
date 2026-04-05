@@ -200,6 +200,8 @@ class ReviewReport(BaseModel):
 class ConsistencyAnalyzeRequest(BaseModel):
     requirement_text: str = Field(..., min_length=1)
     acceptance_criteria: List[str] = Field(default_factory=list)
+    repo_name: str = ""
+    snapshot: str = ""
     candidate_snippets: List[CandidateSnippet] = Field(default_factory=list)
     graph_evidence: GraphEvidenceBundle | None = None
     options: AnalyzeOptions = Field(default_factory=AnalyzeOptions)

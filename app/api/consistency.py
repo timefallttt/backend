@@ -4,6 +4,7 @@ from app.services.consistency.runtime import consistency_service
 from app.services.consistency.schemas import (
     ConsistencyAnalyzeRequest,
     ConsistencyAnalyzeResponse,
+    LlmReviewResult,
     LlmReviewExecuteRequest,
     ReviewDashboardResponse,
     ReviewFeedbackRequest,
@@ -107,5 +108,15 @@ async def analyze_requirement_consistency(
 ) -> ConsistencyAnalyzeResponse:
     try:
         return consistency_service.analyze(request)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
+@router.post("/review", response_model=LlmReviewResult)
+async def review_requirement_consistency(
+    request: ConsistencyAnalyzeRequest,
+) -> LlmReviewResult:
+    try:
+        return consistency_service.review(request)
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc)) from exc

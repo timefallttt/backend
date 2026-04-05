@@ -310,6 +310,13 @@ class WorkItemService:
         item: WorkItemDetail,
     ) -> GraphEvidenceBundle | None:
         snippets = self._to_candidate_snippets(item)
+        return self.expand_graph_evidence_for_snippets(job, snippets)
+
+    def expand_graph_evidence_for_snippets(
+        self,
+        job: IndexJobDetail,
+        snippets: List[CandidateSnippet],
+    ) -> GraphEvidenceBundle | None:
         seeds = self._build_graph_seed_queries(snippets)
         if not seeds:
             return None

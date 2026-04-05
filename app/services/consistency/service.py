@@ -305,14 +305,19 @@ class ConsistencyService:
         requirement_spec = self._build_requirement_spec(request.requirement_text, request.acceptance_criteria)
         requirement_items = self._build_requirement_items(request.requirement_text, request.acceptance_criteria)
         selected_snippets = [snippet for snippet in request.candidate_snippets if snippet.selected]
+        graph_evidence = request.graph_evidence or self._auto_expand_graph_evidence(
+            repo_name=request.repo_name,
+            snapshot=request.snapshot,
+            snippets=selected_snippets,
+        )
         evidence_paths = self._resolve_evidence_paths(request.graph_evidence)
         tool_findings, structural_gaps = self._build_objective_signals(
             selected_snippets=selected_snippets,
-            graph_evidence=request.graph_evidence,
+            graph_evidence=graph_evidence,
         )
-        review_focuses = self._build_review_focuses(selected_snippets, request.graph_evidence)
+        review_focuses = self._build_review_focuses(selected_snippets, graph_evidence)
         evidence_pack = self._build_evidence_pack(
-            request=request,
+            request=request.model_copy(update={'graph_evidence': graph_evidence}),
             tool_findings=tool_findings,
             structural_gaps=structural_gaps,
         )
@@ -327,7 +332,7 @@ class ConsistencyService:
             judgements=[],
             missing_items=[],
             tool_findings=tool_findings,
-            evidence_paths=evidence_paths,
+            evidence_paths=self._resolve_evidence_paths(graph_evidence),
             structural_gaps=structural_gaps,
             review_focuses=review_focuses,
             evidence_pack=evidence_pack,
@@ -335,6 +340,57 @@ class ConsistencyService:
             llm_result=None,
             summary=summary,
         )
+
+    def _auto_expand_graph_evidence(
+        self,
+        *,
+        repo_name: str,
+        snapshot: str,
+        snippets: List[CandidateSnippet],
+    ) -> GraphEvidenceBundle | None:
+        if not repo_name or not snapshot or not snippets:
+            return None
+        try:
+            from app.services.indexing.runtime import indexing_service
+            from app.services.workitems.runtime import workitem_service
+
+            job = indexing_service.find_job_by_scope(repo_name, snapshot)
+            if not job:
+                return None
+            return workitem_service.expand_graph_evidence_for_snippets(job, snippets)
+        except Exception:
+            return None
+
+    def review(self, request: ConsistencyAnalyzeRequest) -> LlmReviewResult:
+        report = self.analyze(request)
+        preview = report.llm_request_preview
+        requirement_items = self._build_requirement_items(request.requirement_text, request.acceptance_criteria)
+        if not preview:
+            return self._build_llm_error_result(
+                provider=LLM_REVIEW_PROVIDER or 'bigmodel',
+                model_name=LLM_REVIEW_MODEL_NAME or 'glm-4.7-flash',
+                requirement_items=requirement_items,
+                response_text='',
+                error_message='未生成 LLM 请求预览，无法执行审阅。',
+            )
+
+        try:
+            gateway_response = self._llm_gateway.submit_review(preview)
+            return self._parse_llm_response(
+                gateway_response.response_text,
+                provider=gateway_response.provider,
+                model_name=gateway_response.model_name,
+                requirement_items=requirement_items,
+                error_message=gateway_response.error_message,
+            )
+        except Exception as exc:
+            return self._build_llm_error_result(
+                provider=LLM_REVIEW_PROVIDER or 'bigmodel',
+                model_name=LLM_REVIEW_MODEL_NAME or 'glm-4.7-flash',
+                requirement_items=requirement_items,
+                response_text='',
+                error_message=f'LLM 审阅执行失败：{exc}',
+            )
 
     def _build_requirement_spec(self, requirement_text: str, criteria: List[str]) -> RequirementSpec:
         raw_items = [requirement_text, *criteria]
