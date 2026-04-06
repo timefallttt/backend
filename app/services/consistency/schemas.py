@@ -8,6 +8,14 @@ TaskStatus = Literal["draft", "ready", "reviewing", "completed", "needs_review"]
 FeedbackDecision = Literal["agree", "question", "misjudged"]
 NodeType = Literal["requirement", "file", "class", "function", "constraint", "ui", "service"]
 LlmReviewVerdict = Literal["satisfied", "partially_satisfied", "not_satisfied", "error"]
+LlmDimensionVerdict = Literal[
+    "satisfied",
+    "partially_satisfied",
+    "not_satisfied",
+    "not_applicable",
+    "insufficient_evidence",
+    "error",
+]
 
 
 class CandidateSnippet(BaseModel):
@@ -153,12 +161,31 @@ class LlmRequestPreview(BaseModel):
     request_body: dict = Field(default_factory=dict)
 
 
+class LlmDimensionAssessment(BaseModel):
+    verdict: LlmDimensionVerdict = "insufficient_evidence"
+    score: float = Field(0.0, ge=0, le=1)
+    reasoning: str = ""
+
+
+class LlmDimensionAssessmentSet(BaseModel):
+    functional_implementation: LlmDimensionAssessment = Field(default_factory=LlmDimensionAssessment)
+    scenario_fit: LlmDimensionAssessment = Field(default_factory=LlmDimensionAssessment)
+    constraint_compliance: LlmDimensionAssessment = Field(default_factory=LlmDimensionAssessment)
+    exception_handling: LlmDimensionAssessment = Field(default_factory=LlmDimensionAssessment)
+    non_functional_compliance: LlmDimensionAssessment = Field(default_factory=LlmDimensionAssessment)
+    evidence_sufficiency: LlmDimensionAssessment = Field(default_factory=LlmDimensionAssessment)
+
+
 class LlmItemAssessment(BaseModel):
     item: str
     verdict: LlmReviewVerdict
+    score: float = Field(0.0, ge=0, le=1)
+    confidence: float = Field(0.0, ge=0, le=1)
     reasoning: str = ""
     supporting_snippet_ids: List[str] = Field(default_factory=list)
     supporting_path_ids: List[str] = Field(default_factory=list)
+    missing_evidence: List[str] = Field(default_factory=list)
+    dimension_assessments: LlmDimensionAssessmentSet = Field(default_factory=LlmDimensionAssessmentSet)
     manual_review_needed: bool = True
 
 
@@ -168,12 +195,13 @@ class LlmReviewResult(BaseModel):
     model_name: str = "pending"
     summary: str
     overall_verdict: LlmReviewVerdict = "error"
+    overall_score_raw: float = Field(0.0, ge=0, le=1)
+    confidence: float = Field(0.0, ge=0, le=1)
     manual_review_needed: bool = True
     item_assessments: List[LlmItemAssessment] = Field(default_factory=list)
     missing_items: List[str] = Field(default_factory=list)
     conflicts: List[str] = Field(default_factory=list)
-    overall_score_raw: float | None = Field(default=None, ge=0, le=1)
-    confidence: float | None = Field(default=None, ge=0, le=1)
+    evidence_gaps: List[str] = Field(default_factory=list)
     response_text: str = ""
     response_body: dict = Field(default_factory=dict)
     error_message: str = ""
