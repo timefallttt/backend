@@ -202,6 +202,7 @@ class LlmReviewResult(BaseModel):
     missing_items: List[str] = Field(default_factory=list)
     conflicts: List[str] = Field(default_factory=list)
     evidence_gaps: List[str] = Field(default_factory=list)
+    used_graph_paths: List[LlmEvidencePath] = Field(default_factory=list)
     response_text: str = ""
     response_body: dict = Field(default_factory=dict)
     error_message: str = ""

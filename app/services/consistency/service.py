@@ -450,11 +450,13 @@ class ConsistencyService:
             len(evidence_pack.snippets if evidence_pack else []),
             len(evidence_pack.graph_paths if evidence_pack and evidence_pack.graph_paths else []),
         )
+        used_graph_paths = self._select_graph_paths_for_prompt(evidence_pack.graph_paths) if evidence_pack else []
         primary_result = self._run_llm_review_round(
             preview=preview,
             requirement_items=requirement_items,
             round_name='primary',
         )
+        primary_result.used_graph_paths = used_graph_paths
         if primary_result.status != 'success':
             logger.warning(
                 'consistency_multi_round_review_primary_failed error=%s',
@@ -486,9 +488,11 @@ class ConsistencyService:
             downgraded.manual_review_needed = True
             downgraded.confidence = round(min(primary_result.confidence, 0.45), 3)
             downgraded.summary = f"{primary_result.summary} Challenge round did not complete; manual review is recommended."
+            downgraded.used_graph_paths = used_graph_paths
             return downgraded
 
         merged = self._merge_llm_results(primary_result, challenge_result, requirement_items)
+        merged.used_graph_paths = used_graph_paths
         logger.info(
             'consistency_multi_round_review_completed overall_verdict=%s confidence=%.3f conflicts=%d evidence_gaps=%d',
             merged.overall_verdict,
@@ -519,10 +523,15 @@ class ConsistencyService:
             error_message=gateway_response.error_message,
         )
         logger.info(
-            'consistency_review_round_finished round=%s status=%s overall_verdict=%s error=%s',
+            'consistency_review_round_finished round=%s status=%s overall_verdict=%s item_count=%d error_item_count=%d missing_items=%d conflicts=%d evidence_gaps=%d error=%s',
             round_name,
             result.status,
             result.overall_verdict,
+            len(result.item_assessments),
+            sum(1 for item in result.item_assessments if item.verdict == 'error'),
+            len(result.missing_items),
+            len(result.conflicts),
+            len(result.evidence_gaps),
             result.error_message or '',
         )
         return result
@@ -533,6 +542,16 @@ class ConsistencyService:
         challenge: LlmReviewResult,
         requirement_items: List[str],
     ) -> LlmReviewResult:
+        logger.info(
+            'consistency_multi_round_merge_started requirement_items=%d primary_items=%d challenge_items=%d primary_missing=%d challenge_missing=%d primary_conflicts=%d challenge_conflicts=%d',
+            len(requirement_items),
+            len(primary.item_assessments),
+            len(challenge.item_assessments),
+            len(primary.missing_items),
+            len(challenge.missing_items),
+            len(primary.conflicts),
+            len(challenge.conflicts),
+        )
         primary_map = {item.item: item for item in primary.item_assessments}
         challenge_map = {item.item: item for item in challenge.item_assessments}
 
@@ -583,6 +602,16 @@ class ConsistencyService:
                 )
             )
             evidence_gaps.extend(merged_missing_evidence)
+            logger.info(
+                'consistency_multi_round_item_merged item=%s primary_verdict=%s challenge_verdict=%s chosen_verdict=%s confidence=%.3f manual_review=%s missing_evidence=%d',
+                item,
+                base.verdict,
+                challenger.verdict,
+                chosen.verdict,
+                merged_confidence,
+                manual_review_needed,
+                len(merged_missing_evidence),
+            )
 
         evidence_gaps = list(dict.fromkeys(evidence_gaps))
         overall_score_raw = round(
@@ -601,6 +630,31 @@ class ConsistencyService:
             or overall_confidence < 0.65
         )
         summary = self._build_merged_summary(merged_items, conflicts, evidence_gaps)
+        error_item_count = sum(1 for item in merged_items if item.verdict == 'error')
+        logger.info(
+            'consistency_multi_round_merge_summary overall_verdict=%s item_count=%d error_item_count=%d overall_score=%.3f overall_confidence=%.3f missing_items=%d conflicts=%d evidence_gaps=%d manual_review=%s summary=%s',
+            overall_verdict,
+            len(merged_items),
+            error_item_count,
+            overall_score_raw,
+            overall_confidence,
+            len(missing_items),
+            len(conflicts),
+            len(evidence_gaps),
+            manual_review_needed,
+            summary,
+        )
+        if not merged_items or error_item_count == len(merged_items):
+            logger.warning(
+                'consistency_multi_round_merge_invalid_result requirement_items=%d primary_items=%d challenge_items=%d primary_summary=%s challenge_summary=%s primary_error=%s challenge_error=%s',
+                len(requirement_items),
+                len(primary.item_assessments),
+                len(challenge.item_assessments),
+                primary.summary,
+                challenge.summary,
+                primary.error_message or '',
+                challenge.error_message or '',
+            )
 
         return LlmReviewResult(
             status='success',
@@ -1547,6 +1601,7 @@ class ConsistencyService:
             missing_items=[],
             conflicts=[],
             evidence_gaps=[error_message] if error_message else [],
+            used_graph_paths=[],
             response_text=response_text,
             response_body={},
             error_message=error_message,
