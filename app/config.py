@@ -11,6 +11,7 @@ REPO_STORAGE_DIR = INDEXING_DIR / 'repos'
 ARTIFACT_STORAGE_DIR = INDEXING_DIR / 'artifacts'
 REVIEW_DIR = RUNTIME_DIR / 'review'
 REVIEW_TASKS_FILE = REVIEW_DIR / 'tasks.json'
+REVIEW_DEBUG_DIR = REVIEW_DIR / 'debug_logs'
 
 ARKANALYZER_CMD = os.getenv('ARKANALYZER_CMD', '').strip()
 ARKANALYZER_ROOT = Path(os.getenv('ARKANALYZER_ROOT', PROJECT_ROOT / 'arkanalyzer'))
@@ -33,5 +34,5 @@ LLM_REVIEW_PROVIDER = os.getenv('LLM_REVIEW_PROVIDER', 'bigmodel').strip()
 LLM_REVIEW_API_URL = os.getenv('LLM_REVIEW_API_URL', 'https://open.bigmodel.cn/api/paas/v4/chat/completions').strip()
 LLM_REVIEW_API_KEY = os.getenv('LLM_REVIEW_API_KEY', '2d79da0ff405413fb3f4c10ffe9c6337.aMezyuvmjffZjfY7').strip()
 LLM_REVIEW_MODEL_NAME = os.getenv('LLM_REVIEW_MODEL_NAME', 'glm-4.7-flash').strip()
-LLM_REVIEW_TIMEOUT_MIN = int(os.getenv('LLM_REVIEW_TIMEOUT_MIN', '5'))
+LLM_REVIEW_TIMEOUT_MIN = int(os.getenv('LLM_REVIEW_TIMEOUT_MIN', '15'))
 LLM_REVIEW_TIMEOUT_SEC = int(os.getenv('LLM_REVIEW_TIMEOUT_SEC', str(LLM_REVIEW_TIMEOUT_MIN * 60)))

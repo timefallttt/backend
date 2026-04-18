@@ -24,6 +24,11 @@ class LlmGatewayResponse:
     model_name: str
     response_text: str
     error_message: str = ""
+    error_type: str = ""
+    error_detail: str = ""
+    request_url: str = ""
+    timeout_sec: int = 0
+    raw_response_excerpt: str = ""
 
 
 class LlmReviewGateway:
@@ -53,6 +58,10 @@ class LlmReviewGateway:
                 model_name=effective_model_name or "pending",
                 response_text="",
                 error_message="未配置 LLM 审阅 API 地址。",
+                error_type="ConfigurationError",
+                error_detail="缺少 LLM_REVIEW_API_URL。",
+                request_url=effective_api_url,
+                timeout_sec=LLM_REVIEW_TIMEOUT_SEC,
             )
 
         if not effective_api_key:
@@ -61,6 +70,10 @@ class LlmReviewGateway:
                 model_name=effective_model_name or "pending",
                 response_text="",
                 error_message="未配置 LLM 审阅 API Key。",
+                error_type="ConfigurationError",
+                error_detail="缺少 LLM_REVIEW_API_KEY。",
+                request_url=effective_api_url,
+                timeout_sec=LLM_REVIEW_TIMEOUT_SEC,
             )
 
         messages = preview.request_body.get("messages") or self._build_messages(preview)
@@ -91,6 +104,9 @@ class LlmReviewGateway:
                     provider=effective_provider,
                     model_name=effective_model_name or BIGMODEL_DEFAULT_MODEL,
                     response_text=response_text,
+                    request_url=effective_api_url,
+                    timeout_sec=LLM_REVIEW_TIMEOUT_SEC,
+                    raw_response_excerpt=self._truncate_text(raw_text),
                 )
         except error.HTTPError as exc:
             raw_text = exc.read().decode("utf-8", errors="replace")
@@ -100,6 +116,11 @@ class LlmReviewGateway:
                 model_name=effective_model_name or BIGMODEL_DEFAULT_MODEL,
                 response_text=raw_text,
                 error_message=f"LLM 审阅请求失败，HTTP {exc.code}。{detail}".strip(),
+                error_type=type(exc).__name__,
+                error_detail=detail,
+                request_url=effective_api_url,
+                timeout_sec=LLM_REVIEW_TIMEOUT_SEC,
+                raw_response_excerpt=self._truncate_text(raw_text),
             )
         except Exception as exc:
             return LlmGatewayResponse(
@@ -107,6 +128,10 @@ class LlmReviewGateway:
                 model_name=effective_model_name or BIGMODEL_DEFAULT_MODEL,
                 response_text="",
                 error_message=f"LLM 审阅请求失败：{exc}",
+                error_type=type(exc).__name__,
+                error_detail=str(exc),
+                request_url=effective_api_url,
+                timeout_sec=LLM_REVIEW_TIMEOUT_SEC,
             )
 
     def _build_messages(self, preview: LlmRequestPreview) -> list[dict]:
@@ -163,3 +188,8 @@ class LlmReviewGateway:
         if message:
             return str(message)
         return raw_text[:300]
+
+    def _truncate_text(self, raw_text: str, limit: int = 1200) -> str:
+        if not raw_text:
+            return ""
+        return raw_text[:limit]

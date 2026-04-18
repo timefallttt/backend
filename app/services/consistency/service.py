@@ -9,6 +9,7 @@ from uuid import uuid4
 from app.config import (
     LLM_REVIEW_MODEL_NAME,
     LLM_REVIEW_PROVIDER,
+    REVIEW_DEBUG_DIR,
     REVIEW_TASKS_FILE,
 )
 
@@ -31,6 +32,7 @@ from .schemas import (
     LlmItemAssessment,
     LlmRequestPreview,
     LlmReviewExecuteRequest,
+    LlmReviewRoundSummary,
     LlmReviewResult,
     RequirementSpec,
     ReviewDashboardResponse,
@@ -242,7 +244,18 @@ class ConsistencyService:
                 requirement_items=self._build_requirement_items(requirement_text, acceptance_criteria),
                 response_text='',
                 error_message=f'LLM 后台审阅执行失败：{exc}',
+                response_body=self._build_error_response_body(
+                    provider=LLM_REVIEW_PROVIDER or 'bigmodel',
+                    model_name=LLM_REVIEW_MODEL_NAME or 'glm-4.7-flash',
+                    error_message=f'LLM 后台审阅执行失败：{exc}',
+                    error_type=type(exc).__name__,
+                ),
             )
+        llm_result = self._persist_and_sanitize_debug_payload(
+            llm_result,
+            source='background_review',
+            requirement_items=self._build_requirement_items(requirement_text, acceptance_criteria),
+        )
 
         with self._lock:
             task = self._tasks.get(task_id)
@@ -383,20 +396,31 @@ class ConsistencyService:
                 request.repo_name or '',
                 request.snapshot or '',
             )
-            return self._build_llm_error_result(
+            result = self._build_llm_error_result(
                 provider=LLM_REVIEW_PROVIDER or 'bigmodel',
                 model_name=LLM_REVIEW_MODEL_NAME or 'glm-4.7-flash',
                 requirement_items=[],
                 response_text='',
                 error_message='No reviewable acceptance criteria were extracted. Add requirement items before running review.',
+                request_previews={'primary': preview.model_dump()} if preview else {},
+            )
+            return self._persist_and_sanitize_debug_payload(
+                result,
+                source='direct_review',
+                requirement_items=[],
             )
         if not preview:
-            return self._build_llm_error_result(
+            result = self._build_llm_error_result(
                 provider=LLM_REVIEW_PROVIDER or 'bigmodel',
                 model_name=LLM_REVIEW_MODEL_NAME or 'glm-4.7-flash',
                 requirement_items=requirement_items,
                 response_text='',
                 error_message='LLM request preview was not generated. Review cannot be executed.',
+            )
+            return self._persist_and_sanitize_debug_payload(
+                result,
+                source='direct_review',
+                requirement_items=requirement_items,
             )
 
         try:
@@ -408,9 +432,14 @@ class ConsistencyService:
                 len(report.evidence_pack.snippets if report.evidence_pack else []),
                 len(report.evidence_pack.graph_paths if report.evidence_pack and report.evidence_pack.graph_paths else []),
             )
-            return self._execute_multi_round_review(
+            result = self._execute_multi_round_review(
                 preview=preview,
                 evidence_pack=report.evidence_pack,
+                requirement_items=requirement_items,
+            )
+            return self._persist_and_sanitize_debug_payload(
+                result,
+                source='direct_review',
                 requirement_items=requirement_items,
             )
         except Exception as exc:
@@ -420,12 +449,24 @@ class ConsistencyService:
                 request.snapshot or '',
                 exc,
             )
-            return self._build_llm_error_result(
+            result = self._build_llm_error_result(
                 provider=LLM_REVIEW_PROVIDER or 'bigmodel',
                 model_name=LLM_REVIEW_MODEL_NAME or 'glm-4.7-flash',
                 requirement_items=requirement_items,
                 response_text='',
                 error_message=f'LLM review execution failed: {exc}',
+                request_previews={'primary': preview.model_dump()},
+                response_body=self._build_error_response_body(
+                    provider=LLM_REVIEW_PROVIDER or 'bigmodel',
+                    model_name=LLM_REVIEW_MODEL_NAME or 'glm-4.7-flash',
+                    error_message=f'LLM review execution failed: {exc}',
+                    error_type=type(exc).__name__,
+                ),
+            )
+            return self._persist_and_sanitize_debug_payload(
+                result,
+                source='direct_review',
+                requirement_items=requirement_items,
             )
 
     def _execute_multi_round_review(
@@ -457,12 +498,51 @@ class ConsistencyService:
             round_name='primary',
         )
         primary_result.used_graph_paths = used_graph_paths
+        primary_result.request_previews = {
+            'primary': preview.model_dump(),
+        }
         if primary_result.status != 'success':
             logger.warning(
                 'consistency_multi_round_review_primary_failed error=%s',
                 primary_result.error_message,
             )
+            primary_result.review_strategy = 'primary_failed'
+            primary_result.merge_summary = '初审未成功完成，结果已按错误处理。'
+            primary_result.review_rounds = [
+                self._build_review_round_summary(
+                    round_name='primary',
+                    result=primary_result,
+                )
+            ]
             return primary_result
+
+        challenge_reasons = self._collect_challenge_reasons(primary_result, requirement_items)
+        if not challenge_reasons:
+            primary_only = primary_result.model_copy(deep=True)
+            primary_only.review_strategy = 'primary_only'
+            primary_only.challenge_triggered = False
+            primary_only.challenge_reasons = []
+            primary_only.merge_summary = '本次审阅未触发复核，直接采用主审结论。'
+            primary_only.summary = self._build_primary_only_summary(primary_only)
+            primary_only.item_assessments = [
+                self._decorate_primary_only_item(item)
+                for item in primary_only.item_assessments
+            ]
+            primary_only.review_rounds = [
+                self._build_review_round_summary(
+                    round_name='primary',
+                    result=primary_only,
+                )
+            ]
+            primary_only.request_previews = {
+                'primary': preview.model_dump(),
+            }
+            logger.info(
+                'consistency_multi_round_review_skipped challenge=false confidence=%.3f item_count=%d',
+                primary_only.confidence,
+                len(primary_only.item_assessments),
+            )
+            return primary_only
 
         challenge_preview = self._build_llm_request_preview(
             evidence_pack or LlmEvidencePack(
@@ -471,6 +551,7 @@ class ConsistencyService:
             ),
             review_mode='challenge',
             prior_result=primary_result,
+            review_notes=challenge_reasons,
         )
         challenge_result = self._run_llm_review_round(
             preview=challenge_preview,
@@ -487,12 +568,79 @@ class ConsistencyService:
             downgraded.evidence_gaps.append('Challenge round result is unavailable. Key conclusions should be spot-checked manually.')
             downgraded.manual_review_needed = True
             downgraded.confidence = round(min(primary_result.confidence, 0.45), 3)
-            downgraded.summary = f"{primary_result.summary} Challenge round did not complete; manual review is recommended."
+            downgraded.review_strategy = 'challenge_failed'
+            downgraded.challenge_triggered = True
+            downgraded.challenge_reasons = challenge_reasons
+            downgraded.merge_summary = '已触发复核，但复核轮未成功完成；最终保留主审结论并下调置信度。'
+            downgraded.summary = '已触发复核，但复核未成功完成；当前结果仍以主审为准，建议人工复核。'
             downgraded.used_graph_paths = used_graph_paths
+            downgraded.item_assessments = [
+                item.model_copy(
+                    update={
+                        'merge_decision': 'primary_after_failed_challenge',
+                        'merge_reason': '复核轮失败，当前条目暂保留主审结论，并建议人工复核。',
+                    }
+                )
+                for item in downgraded.item_assessments
+            ]
+            downgraded.review_rounds = [
+                self._build_review_round_summary(
+                    round_name='primary',
+                    result=primary_result,
+                ),
+                self._build_review_round_summary(
+                    round_name='challenge',
+                    result=challenge_result,
+                    trigger_reasons=challenge_reasons,
+                ),
+            ]
+            downgraded.request_previews = {
+                'primary': preview.model_dump(),
+                'challenge': challenge_preview.model_dump(),
+            }
+            downgraded.response_body = {
+                'primary': primary_result.response_body,
+                'challenge_failure': challenge_result.response_body,
+                'merged': {
+                    'summary': downgraded.summary,
+                    'overall_verdict': downgraded.overall_verdict,
+                    'overall_score_raw': downgraded.overall_score_raw,
+                    'confidence': downgraded.confidence,
+                    'merge_summary': downgraded.merge_summary,
+                    'challenge_reasons': challenge_reasons,
+                },
+            }
+            downgraded.response_text = json.dumps(
+                {
+                    'primary': primary_result.response_body,
+                    'challenge_failure': challenge_result.response_body,
+                },
+                ensure_ascii=False,
+            )
             return downgraded
 
-        merged = self._merge_llm_results(primary_result, challenge_result, requirement_items)
+        merged = self._merge_llm_results(
+            primary_result,
+            challenge_result,
+            requirement_items,
+            challenge_reasons=challenge_reasons,
+        )
         merged.used_graph_paths = used_graph_paths
+        merged.request_previews = {
+            'primary': preview.model_dump(),
+            'challenge': challenge_preview.model_dump(),
+        }
+        merged.review_rounds = [
+            self._build_review_round_summary(
+                round_name='primary',
+                result=primary_result,
+            ),
+            self._build_review_round_summary(
+                round_name='challenge',
+                result=challenge_result,
+                trigger_reasons=challenge_reasons,
+            ),
+        ]
         logger.info(
             'consistency_multi_round_review_completed overall_verdict=%s confidence=%.3f conflicts=%d evidence_gaps=%d',
             merged.overall_verdict,
@@ -521,6 +669,11 @@ class ConsistencyService:
             model_name=gateway_response.model_name,
             requirement_items=requirement_items,
             error_message=gateway_response.error_message,
+            gateway_error_type=gateway_response.error_type,
+            gateway_error_detail=gateway_response.error_detail,
+            request_url=gateway_response.request_url,
+            timeout_sec=gateway_response.timeout_sec,
+            raw_response_excerpt=gateway_response.raw_response_excerpt,
         )
         logger.info(
             'consistency_review_round_finished round=%s status=%s overall_verdict=%s item_count=%d error_item_count=%d missing_items=%d conflicts=%d evidence_gaps=%d error=%s',
@@ -536,11 +689,114 @@ class ConsistencyService:
         )
         return result
 
+    def _collect_challenge_reasons(
+        self,
+        primary_result: LlmReviewResult,
+        requirement_items: List[str],
+    ) -> List[str]:
+        reasons: List[str] = []
+        if primary_result.manual_review_needed:
+            reasons.append('初审已将结果标记为需要人工复核。')
+        if primary_result.confidence < 0.75:
+            reasons.append(f'初审综合置信度偏低（{primary_result.confidence:.3f}）。')
+        if primary_result.evidence_gaps:
+            reasons.append(f'初审识别到 {len(primary_result.evidence_gaps)} 项证据缺口。')
+        if primary_result.conflicts:
+            reasons.append(f'初审返回了 {len(primary_result.conflicts)} 项内部冲突。')
+
+        flagged_items = [item.item for item in primary_result.item_assessments if item.manual_review_needed]
+        if flagged_items:
+            reasons.append(f'有 {len(flagged_items)} 条验收项被标记为需要进一步核查。')
+
+        dimension_conflicts = [
+            item.item
+            for item in primary_result.item_assessments
+            if self._has_dimension_conflict(item)
+        ]
+        if dimension_conflicts:
+            reasons.append(f'有 {len(dimension_conflicts)} 条验收项存在“实现判断”与“证据充分性”不一致。')
+
+        high_risk_items = [item for item in requirement_items if self._is_high_risk_requirement_item(item)]
+        if high_risk_items:
+            reasons.append(f'当前包含 {len(high_risk_items)} 条高风险验收项（异常处理、资源释放、状态一致性等）。')
+
+        weak_reasoning_count = sum(
+            1
+            for item in primary_result.item_assessments
+            if len((item.reasoning or '').strip()) < 24
+        )
+        if primary_result.item_assessments and weak_reasoning_count == len(primary_result.item_assessments):
+            reasons.append('初审对所有验收项的文字说明都较弱，需复核其结论依据。')
+
+        return list(dict.fromkeys(reasons))
+
+    def _is_high_risk_requirement_item(self, item: str) -> bool:
+        normalized = (item or '').lower()
+        keywords = (
+            '异常', '失败', '错误', '回滚', '重试', '超时', '资源', '释放', '关闭',
+            '状态', '一致', '并发', '锁', '事务', '权限', '安全', '定时', '计时',
+            'stop', 'release', 'close', 'rollback', 'retry', 'timeout',
+        )
+        return any(token in normalized for token in keywords)
+
+    def _has_dimension_conflict(self, item: LlmItemAssessment) -> bool:
+        implementation = item.dimension_assessments.implementation_coverage.verdict
+        evidence = item.dimension_assessments.evidence_sufficiency.verdict
+        if item.verdict == 'satisfied' and evidence in {'insufficient_evidence', 'not_satisfied', 'error'}:
+            return True
+        if implementation in {'satisfied', 'partially_satisfied'} and evidence in {'insufficient_evidence', 'error'}:
+            return True
+        if implementation in {'not_satisfied', 'error'} and evidence == 'satisfied':
+            return True
+        return False
+
+    def _decorate_primary_only_item(self, item: LlmItemAssessment) -> LlmItemAssessment:
+        return item.model_copy(
+            update={
+                'merge_decision': 'primary_only',
+                'merge_reason': '本次未触发复核，直接采用主审结论。',
+            }
+        )
+
+    def _build_primary_only_summary(self, result: LlmReviewResult) -> str:
+        items = result.item_assessments
+        if not items:
+            return '主审未产生有效的验收项结论。'
+        satisfied_count = sum(1 for item in items if item.verdict == 'satisfied')
+        partial_count = sum(1 for item in items if item.verdict == 'partially_satisfied')
+        not_satisfied_count = sum(1 for item in items if item.verdict == 'not_satisfied')
+        parts = [
+            f'单轮审阅完成：满足 {satisfied_count} 项，部分满足 {partial_count} 项，不满足 {not_satisfied_count} 项。'
+        ]
+        if result.evidence_gaps:
+            parts.append(f'识别出 {len(result.evidence_gaps)} 项证据缺口。')
+        if result.manual_review_needed:
+            parts.append('部分结论仍建议人工复核。')
+        return ''.join(parts)
+
+    def _build_review_round_summary(
+        self,
+        *,
+        round_name: str,
+        result: LlmReviewResult,
+        trigger_reasons: List[str] | None = None,
+    ) -> LlmReviewRoundSummary:
+        status = 'success' if result.status == 'success' else 'error'
+        return LlmReviewRoundSummary(
+            round_name=round_name,
+            status=status,
+            summary=result.summary,
+            error_message=result.error_message,
+            trigger_reasons=list(trigger_reasons or []),
+        )
+
     def _merge_llm_results(
         self,
         primary: LlmReviewResult,
         challenge: LlmReviewResult,
         requirement_items: List[str],
+        *,
+        challenge_reasons: List[str],
     ) -> LlmReviewResult:
         logger.info(
             'consistency_multi_round_merge_started requirement_items=%d primary_items=%d challenge_items=%d primary_missing=%d challenge_missing=%d primary_conflicts=%d challenge_conflicts=%d',
@@ -574,6 +830,11 @@ class ConsistencyService:
             base_rank = self._verdict_rank(base.verdict)
             challenger_rank = self._verdict_rank(challenger.verdict)
             chosen = challenger if challenger_rank > base_rank else base
+            merge_decision, merge_reason = self._determine_item_merge_reason(
+                base,
+                challenger,
+                chosen,
+            )
             agreement_ratio = self._dimension_agreement_ratio(
                 base.dimension_assessments,
                 challenger.dimension_assessments,
@@ -599,6 +860,8 @@ class ConsistencyService:
                     missing_evidence=merged_missing_evidence,
                     dimension_assessments=merged_dimension_assessments,
                     manual_review_needed=manual_review_needed,
+                    merge_decision=merge_decision,
+                    merge_reason=merge_reason,
                 )
             )
             evidence_gaps.extend(merged_missing_evidence)
@@ -630,6 +893,7 @@ class ConsistencyService:
             or overall_confidence < 0.65
         )
         summary = self._build_merged_summary(merged_items, conflicts, evidence_gaps)
+        merge_summary = self._build_merge_summary(conflicts, evidence_gaps, manual_review_needed)
         error_item_count = sum(1 for item in merged_items if item.verdict == 'error')
         logger.info(
             'consistency_multi_round_merge_summary overall_verdict=%s item_count=%d error_item_count=%d overall_score=%.3f overall_confidence=%.3f missing_items=%d conflicts=%d evidence_gaps=%d manual_review=%s summary=%s',
@@ -669,6 +933,10 @@ class ConsistencyService:
             missing_items=missing_items,
             conflicts=conflicts,
             evidence_gaps=evidence_gaps,
+            review_strategy='conditional_two_round',
+            challenge_triggered=True,
+            challenge_reasons=challenge_reasons,
+            merge_summary=merge_summary,
             response_text=json.dumps(
                 {
                     'primary': primary.response_body,
@@ -684,6 +952,8 @@ class ConsistencyService:
                     'overall_verdict': overall_verdict,
                     'overall_score_raw': overall_score_raw,
                     'confidence': overall_confidence,
+                    'merge_summary': merge_summary,
+                    'challenge_reasons': challenge_reasons,
                 },
             },
             error_message='',
@@ -696,31 +966,74 @@ class ConsistencyService:
         evidence_gaps: List[str],
     ) -> str:
         if not items:
-            parts = ['Two-round review did not produce any valid item-level conclusions.']
+            parts = ['两轮审阅未产出有效的验收项结论。']
             if conflicts:
-                parts.append(f'Found {len(conflicts)} disagreements between primary and challenge rounds.')
+                parts.append(f'初审与复核之间存在 {len(conflicts)} 项冲突。')
             if evidence_gaps:
-                parts.append(f'Identified {len(evidence_gaps)} evidence gaps.')
-            return ' '.join(parts)
+                parts.append(f'识别出 {len(evidence_gaps)} 项证据缺口。')
+            return ''.join(parts)
         satisfied_count = sum(1 for item in items if item.verdict == 'satisfied')
         partial_count = sum(1 for item in items if item.verdict == 'partially_satisfied')
         not_satisfied_count = sum(1 for item in items if item.verdict == 'not_satisfied')
         error_count = sum(1 for item in items if item.verdict == 'error')
         if error_count == len(items):
-            parts = ['Two-round review did not produce a valid verdict; the result is treated as error.']
+            parts = ['两轮审阅未形成有效结论，结果按错误处理。']
             if evidence_gaps:
-                parts.append(f'Identified {len(evidence_gaps)} evidence gaps.')
+                parts.append(f'识别出 {len(evidence_gaps)} 项证据缺口。')
             if conflicts:
-                parts.append(f'Found {len(conflicts)} disagreements between primary and challenge rounds.')
-            return ' '.join(parts)
+                parts.append(f'初审与复核之间存在 {len(conflicts)} 项冲突。')
+            return ''.join(parts)
         parts = [
-            f'Two-round review completed: satisfied {satisfied_count}, partially satisfied {partial_count}, not satisfied {not_satisfied_count}.'
+            f'两轮审阅完成：满足 {satisfied_count} 项，部分满足 {partial_count} 项，不满足 {not_satisfied_count} 项。'
         ]
         if conflicts:
-            parts.append(f'Found {len(conflicts)} disagreements between primary and challenge rounds; the stricter conclusion was kept.')
+            parts.append(f'初审与复核之间存在 {len(conflicts)} 项冲突，系统已保留更严格的结论。')
         if evidence_gaps:
-            parts.append(f'Identified {len(evidence_gaps)} evidence gaps.')
-        return ' '.join(parts)
+            parts.append(f'识别出 {len(evidence_gaps)} 项证据缺口。')
+        return ''.join(parts)
+
+    def _build_merge_summary(
+        self,
+        conflicts: List[str],
+        evidence_gaps: List[str],
+        manual_review_needed: bool,
+    ) -> str:
+        parts = ['结果并入策略：']
+        if conflicts:
+            parts.append('对初审与复核不一致的条目，优先保留更严格的结论。')
+        else:
+            parts.append('初审与复核整体一致，直接保留一致结论。')
+        if evidence_gaps:
+            parts.append(f'同时保留 {len(evidence_gaps)} 项证据缺口，提醒用户关注缺失证据。')
+        if manual_review_needed:
+            parts.append('由于仍存在冲突、证据不足或低置信度条目，最终结果仍建议人工复核。')
+        return ''.join(parts)
+
+    def _determine_item_merge_reason(
+        self,
+        primary: LlmItemAssessment,
+        challenge: LlmItemAssessment,
+        chosen: LlmItemAssessment,
+    ) -> tuple[str, str]:
+        if primary.verdict == challenge.verdict:
+            return (
+                'agreement',
+                '初审与复核对该条目结论一致，直接保留一致结论。',
+            )
+        if challenge.verdict == 'error':
+            return (
+                'keep_primary_after_challenge_error',
+                '复核未给出有效结论，因此暂保留初审结论。',
+            )
+        if chosen is challenge:
+            return (
+                'use_stricter_challenge',
+                f'复核结论比初审更严格（{primary.verdict} -> {challenge.verdict}），最终按更严格结论收敛。',
+            )
+        return (
+            'keep_stricter_primary',
+            f'初审结论比复核更严格（{challenge.verdict} -> {primary.verdict}），最终保留更严格的初审结论。',
+        )
 
     def _combine_reasoning(self, primary_reasoning: str, challenge_reasoning: str) -> str:
         normalized_primary = (primary_reasoning or '').strip()
@@ -814,11 +1127,7 @@ class ConsistencyService:
                 'reasoning': reasoning,
             }
             for key in (
-                'functional_implementation',
-                'scenario_fit',
-                'constraint_compliance',
-                'exception_handling',
-                'non_functional_compliance',
+                'implementation_coverage',
                 'evidence_sufficiency',
             )
         }
@@ -1072,6 +1381,7 @@ class ConsistencyService:
         *,
         review_mode: str = 'primary',
         prior_result: LlmReviewResult | None = None,
+        review_notes: List[str] | None = None,
     ) -> LlmRequestPreview:
         if review_mode == 'challenge':
             system_message = (
@@ -1091,6 +1401,7 @@ class ConsistencyService:
             evidence_pack,
             review_mode=review_mode,
             prior_result=prior_result,
+            review_notes=review_notes,
         )
         request_body = {
             'messages': [
@@ -1112,6 +1423,7 @@ class ConsistencyService:
                     'acceptance_criteria_count': len(evidence_pack.acceptance_criteria),
                     'tool_finding_count': len(evidence_pack.tool_findings),
                 },
+                'review_notes': list(review_notes or []),
                 'notes': [
                     '以下输入不包含系统先验判定结果。',
                     '若证据不足，请明确指出缺失证据类型，而不是依据猜测下结论。',
@@ -1154,11 +1466,7 @@ class ConsistencyService:
                     'manual_review_needed',
                 ],
                 'dimension_assessment_fields': {
-                    'functional_implementation': ['verdict', 'score', 'reasoning'],
-                    'scenario_fit': ['verdict', 'score', 'reasoning'],
-                    'constraint_compliance': ['verdict', 'score', 'reasoning'],
-                    'exception_handling': ['verdict', 'score', 'reasoning'],
-                    'non_functional_compliance': ['verdict', 'score', 'reasoning'],
+                    'implementation_coverage': ['verdict', 'score', 'reasoning'],
                     'evidence_sufficiency': ['verdict', 'score', 'reasoning'],
                 },
             },
@@ -1181,6 +1489,7 @@ class ConsistencyService:
         *,
         review_mode: str = 'primary',
         prior_result: LlmReviewResult | None = None,
+        review_notes: List[str] | None = None,
     ) -> str:
         lines: List[str] = []
         if review_mode == 'challenge':
@@ -1253,23 +1562,30 @@ class ConsistencyService:
             lines.append('无额外客观信号。')
         lines.append('')
         if review_mode == 'challenge' and prior_result:
-            lines.append('六、初审结果（待复核）')
+            lines.append('六、复核触发原因')
+            if review_notes:
+                for note in review_notes:
+                    lines.append(f'- {note}')
+            else:
+                lines.append('未提供。')
+            lines.append('')
+            lines.append('七、初审结果（待复核）')
             lines.append(json.dumps(prior_result.model_dump(), ensure_ascii=False, indent=2))
             lines.append('')
-            lines.append('七、输出要求')
+            lines.append('八、输出要求')
         else:
             lines.append('六、输出要求')
         lines.append('请返回 JSON 对象，字段必须满足 output_contract。')
         lines.append('顶层字段必须完整包含：summary, overall_verdict, overall_score_raw, confidence, manual_review_needed, item_assessments, missing_items, conflicts, evidence_gaps。')
         lines.append('item_assessments 中每一项必须完整包含：item, verdict, score, confidence, reasoning, supporting_snippet_ids, supporting_path_ids, missing_evidence, dimension_assessments, manual_review_needed。')
         lines.append('overall_verdict 和 verdict 只允许使用：satisfied, partially_satisfied, not_satisfied。')
-        lines.append('dimension_assessments 必须完整包含：functional_implementation, scenario_fit, constraint_compliance, exception_handling, non_functional_compliance, evidence_sufficiency。')
+        lines.append('dimension_assessments 必须完整包含：implementation_coverage, evidence_sufficiency。')
         lines.append('每个维度对象必须完整包含：verdict, score, reasoning。')
         lines.append('维度 verdict 允许使用：satisfied, partially_satisfied, not_satisfied, not_applicable, insufficient_evidence。')
         lines.append('所有字段都必须出现；没有内容时返回空数组、空字符串或 0，不允许省略字段。')
         lines.append('不要使用 Markdown 代码块，不要额外包裹 answer、data、result 等外层字段，直接返回目标 JSON 对象本身。')
         lines.append('字段名必须严格一致，不要改写成 item_id、status、items、analysis 等其他名字。')
-        lines.append('返回格式示例：{"summary":"...","overall_verdict":"partially_satisfied","overall_score_raw":0.5,"confidence":0.78,"manual_review_needed":true,"item_assessments":[{"item":"验收标准原文","verdict":"satisfied","score":1.0,"confidence":0.84,"reasoning":"...","supporting_snippet_ids":["snippet-1"],"supporting_path_ids":["path-1"],"missing_evidence":[],"dimension_assessments":{"functional_implementation":{"verdict":"satisfied","score":1.0,"reasoning":"..."},"scenario_fit":{"verdict":"satisfied","score":1.0,"reasoning":"..."},"constraint_compliance":{"verdict":"partially_satisfied","score":0.5,"reasoning":"..."},"exception_handling":{"verdict":"insufficient_evidence","score":0.0,"reasoning":"..."},"non_functional_compliance":{"verdict":"not_applicable","score":1.0,"reasoning":"..."},"evidence_sufficiency":{"verdict":"partially_satisfied","score":0.5,"reasoning":"..."}},"manual_review_needed":false}],"missing_items":[],"conflicts":[],"evidence_gaps":[]}')
+        lines.append('返回格式示例：{"summary":"...","overall_verdict":"partially_satisfied","overall_score_raw":0.5,"confidence":0.78,"manual_review_needed":true,"item_assessments":[{"item":"验收标准原文","verdict":"satisfied","score":1.0,"confidence":0.84,"reasoning":"...","supporting_snippet_ids":["snippet-1"],"supporting_path_ids":["path-1"],"missing_evidence":[],"dimension_assessments":{"implementation_coverage":{"verdict":"satisfied","score":1.0,"reasoning":"..."},"evidence_sufficiency":{"verdict":"partially_satisfied","score":0.5,"reasoning":"..."}},"manual_review_needed":false}],"missing_items":[],"conflicts":[],"evidence_gaps":[]}')
         lines.append('你需要自己判断每条验收标准与哪些证据相关，不要假设系统已经完成证据归因。')
         lines.append('如果证据不足，请明确说明证据不足，而不是猜测实现存在。')
         return '\n'.join(lines)
@@ -1362,13 +1678,23 @@ class ConsistencyService:
         model_name: str,
         requirement_items: List[str],
         error_message: str = "",
+        gateway_error_type: str = "",
+        gateway_error_detail: str = "",
+        request_url: str = "",
+        timeout_sec: int = 0,
+        raw_response_excerpt: str = "",
     ) -> LlmReviewResult:
         if error_message:
             logger.warning(
-                'consistency_llm_gateway_error provider=%s model=%s error=%s',
+                'consistency_llm_gateway_error provider=%s model=%s error_type=%s request_url=%s timeout_sec=%s error=%s detail=%s raw_excerpt=%s',
                 provider,
                 model_name,
+                gateway_error_type or '',
+                request_url or '',
+                timeout_sec,
                 error_message,
+                gateway_error_detail or '',
+                raw_response_excerpt or '',
             )
             return self._build_llm_error_result(
                 provider=provider,
@@ -1376,16 +1702,28 @@ class ConsistencyService:
                 requirement_items=requirement_items,
                 response_text=response_text,
                 error_message=error_message,
+                response_body=self._build_error_response_body(
+                    provider=provider,
+                    model_name=model_name,
+                    error_message=error_message,
+                    error_type=gateway_error_type,
+                    error_detail=gateway_error_detail,
+                    request_url=request_url,
+                    timeout_sec=timeout_sec,
+                    raw_response_excerpt=raw_response_excerpt,
+                    response_text=response_text,
+                ),
             )
 
         try:
             payload = self._load_llm_json_payload(response_text)
         except Exception as exc:
             logger.warning(
-                'consistency_llm_json_invalid provider=%s model=%s error=%s',
+                'consistency_llm_json_invalid provider=%s model=%s error=%s response_excerpt=%s',
                 provider,
                 model_name,
                 exc,
+                self._truncate_debug_text(response_text),
             )
             return self._build_llm_error_result(
                 provider=provider,
@@ -1393,6 +1731,13 @@ class ConsistencyService:
                 requirement_items=requirement_items,
                 response_text=response_text,
                 error_message=f'LLM response is not valid JSON: {exc}',
+                response_body=self._build_error_response_body(
+                    provider=provider,
+                    model_name=model_name,
+                    error_message=f'LLM response is not valid JSON: {exc}',
+                    error_type=type(exc).__name__,
+                    response_text=response_text,
+                ),
             )
 
         try:
@@ -1440,11 +1785,7 @@ class ConsistencyService:
                     raise ValueError('dimension_assessments must be an object')
                 parsed_dimensions: dict = {}
                 for dimension_key in (
-                    'functional_implementation',
-                    'scenario_fit',
-                    'constraint_compliance',
-                    'exception_handling',
-                    'non_functional_compliance',
+                    'implementation_coverage',
                     'evidence_sufficiency',
                 ):
                     dimension_value = raw_dimensions[dimension_key]
@@ -1504,10 +1845,11 @@ class ConsistencyService:
             )
         except Exception as exc:
             logger.warning(
-                'consistency_llm_payload_invalid provider=%s model=%s error=%s',
+                'consistency_llm_payload_invalid provider=%s model=%s error=%s response_excerpt=%s',
                 provider,
                 model_name,
                 exc,
+                self._truncate_debug_text(response_text),
             )
             return self._build_llm_error_result(
                 provider=provider,
@@ -1515,6 +1857,13 @@ class ConsistencyService:
                 requirement_items=requirement_items,
                 response_text=response_text,
                 error_message=f'LLM response schema validation failed: {exc}',
+                response_body=self._build_error_response_body(
+                    provider=provider,
+                    model_name=model_name,
+                    error_message=f'LLM response schema validation failed: {exc}',
+                    error_type=type(exc).__name__,
+                    response_text=response_text,
+                ),
             )
 
     def _load_llm_json_payload(self, response_text: str) -> dict:
@@ -1566,6 +1915,10 @@ class ConsistencyService:
         requirement_items: List[str],
         response_text: str,
         error_message: str,
+        request_previews: dict | None = None,
+        response_body: dict | None = None,
+        review_rounds: List[LlmReviewRoundSummary] | None = None,
+        merge_summary: str = "",
     ) -> LlmReviewResult:
         logger.error(
             'consistency_llm_error_result provider=%s model=%s requirement_items=%d error=%s',
@@ -1578,7 +1931,7 @@ class ConsistencyService:
             status='error',
             provider=provider,
             model_name=model_name,
-            summary='LLM review did not complete; the result has been treated as error.',
+            summary='LLM 审阅未成功完成，当前结果按错误处理。',
             overall_verdict='error',
             overall_score_raw=0.0,
             confidence=0.0,
@@ -1595,6 +1948,8 @@ class ConsistencyService:
                     missing_evidence=[error_message],
                     dimension_assessments=self._build_uniform_dimension_set('error', 0.0, error_message),
                     manual_review_needed=True,
+                    merge_decision='error',
+                    merge_reason='审阅流程未完成，当前条目按错误处理。',
                 )
                 for item in requirement_items
             ],
@@ -1602,10 +1957,132 @@ class ConsistencyService:
             conflicts=[],
             evidence_gaps=[error_message] if error_message else [],
             used_graph_paths=[],
+            review_strategy='error',
+            challenge_triggered=False,
+            challenge_reasons=[],
+            merge_summary=merge_summary or '审阅流程未成功完成，因此没有可用的并入结果。',
+            review_rounds=list(review_rounds or []),
+            request_previews=dict(request_previews or {}),
             response_text=response_text,
-            response_body={},
+            response_body=dict(response_body or {}),
             error_message=error_message,
         )
+
+    def _build_error_response_body(
+        self,
+        *,
+        provider: str,
+        model_name: str,
+        error_message: str,
+        error_type: str = "",
+        error_detail: str = "",
+        request_url: str = "",
+        timeout_sec: int = 0,
+        raw_response_excerpt: str = "",
+        response_text: str = "",
+        extra: dict | None = None,
+    ) -> dict:
+        body = {
+            'provider': provider,
+            'model_name': model_name,
+            'error_message': error_message,
+            'error_type': error_type,
+            'error_detail': error_detail,
+            'request_url': request_url,
+            'timeout_sec': timeout_sec,
+            'raw_response_excerpt': raw_response_excerpt,
+            'response_text_excerpt': self._truncate_debug_text(response_text),
+        }
+        if extra:
+            body.update(extra)
+        return body
+
+    def _truncate_debug_text(self, text: str, limit: int = 1500) -> str:
+        if not text:
+            return ''
+        return text[:limit]
+
+    def _persist_and_sanitize_debug_payload(
+        self,
+        result: LlmReviewResult,
+        *,
+        source: str,
+        requirement_items: List[str],
+    ) -> LlmReviewResult:
+        debug_payload = self._extract_debug_payload(result, source=source, requirement_items=requirement_items)
+        if debug_payload:
+            self._write_debug_log(debug_payload)
+
+        return result.model_copy(
+            update={
+                'request_previews': {},
+                'response_text': '',
+                'response_body': {},
+            }
+        )
+
+    def _extract_debug_payload(
+        self,
+        result: LlmReviewResult,
+        *,
+        source: str,
+        requirement_items: List[str],
+    ) -> dict:
+        if (
+            not result.request_previews
+            and not result.response_text
+            and not result.response_body
+        ):
+            return {}
+
+        return {
+            'saved_at': datetime.now().isoformat(timespec='seconds'),
+            'source': source,
+            'status': result.status,
+            'provider': result.provider,
+            'model_name': result.model_name,
+            'summary': result.summary,
+            'overall_verdict': result.overall_verdict,
+            'error_message': result.error_message,
+            'requirement_items': list(requirement_items),
+            'review_strategy': result.review_strategy,
+            'challenge_triggered': result.challenge_triggered,
+            'challenge_reasons': list(result.challenge_reasons),
+            'review_rounds': [round_item.model_dump() for round_item in result.review_rounds],
+            'request_previews': result.request_previews,
+            'response_body': result.response_body,
+            'response_text': result.response_text,
+        }
+
+    def _write_debug_log(self, payload: dict) -> None:
+        try:
+            REVIEW_DEBUG_DIR.mkdir(parents=True, exist_ok=True)
+            filename = f"consistency-review-{datetime.now().strftime('%Y%m%d-%H%M%S')}-{uuid4().hex[:8]}.json"
+            target = REVIEW_DEBUG_DIR / filename
+            target.write_text(
+                json.dumps(payload, ensure_ascii=False, indent=2),
+                encoding='utf-8',
+            )
+            self._trim_debug_logs()
+            logger.info(
+                'consistency_debug_log_saved path=%s size=%d',
+                str(target),
+                target.stat().st_size,
+            )
+        except Exception as exc:
+            logger.warning('consistency_debug_log_save_failed error=%s', exc)
+
+    def _trim_debug_logs(self) -> None:
+        try:
+            files = sorted(
+                REVIEW_DEBUG_DIR.glob('consistency-review-*.json'),
+                key=lambda item: item.stat().st_mtime,
+                reverse=True,
+            )
+            for extra_file in files[3:]:
+                extra_file.unlink(missing_ok=True)
+        except Exception as exc:
+            logger.warning('consistency_debug_log_trim_failed error=%s', exc)
 
     def _apply_llm_result(self, report: ReviewReport, llm_result: LlmReviewResult) -> ReviewReport:
         judgement_map = {
@@ -1672,14 +2149,12 @@ class ConsistencyService:
         notes = [assessment.reasoning.strip()] if assessment.reasoning.strip() else []
         if assessment.missing_evidence:
             notes.append(f"缺失证据：{'；'.join(assessment.missing_evidence)}")
+        if assessment.merge_reason:
+            notes.append(f'并入说明：{assessment.merge_reason}')
         dimension_bits = []
         dimension_labels = {
-            'functional_implementation': '功能实现',
-            'scenario_fit': '场景适配',
-            'constraint_compliance': '约束符合',
-            'exception_handling': '异常处理',
-            'non_functional_compliance': '非功能要求',
-            'evidence_sufficiency': '证据充分性',
+            'implementation_coverage': '需求实现程度',
+            'evidence_sufficiency': '证据充分程度',
         }
         for key, label in dimension_labels.items():
             dimension = getattr(assessment.dimension_assessments, key)
@@ -1731,6 +2206,7 @@ class ConsistencyService:
 
     def _ensure_storage(self) -> None:
         REVIEW_TASKS_FILE.parent.mkdir(parents=True, exist_ok=True)
+        REVIEW_DEBUG_DIR.mkdir(parents=True, exist_ok=True)
 
     def _load_tasks(self) -> None:
         if not REVIEW_TASKS_FILE.exists():
@@ -1746,3 +2222,5 @@ class ConsistencyService:
 
     def _now(self) -> str:
         return datetime.now().isoformat(timespec='seconds')
+
+

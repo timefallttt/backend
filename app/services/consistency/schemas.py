@@ -168,11 +168,7 @@ class LlmDimensionAssessment(BaseModel):
 
 
 class LlmDimensionAssessmentSet(BaseModel):
-    functional_implementation: LlmDimensionAssessment = Field(default_factory=LlmDimensionAssessment)
-    scenario_fit: LlmDimensionAssessment = Field(default_factory=LlmDimensionAssessment)
-    constraint_compliance: LlmDimensionAssessment = Field(default_factory=LlmDimensionAssessment)
-    exception_handling: LlmDimensionAssessment = Field(default_factory=LlmDimensionAssessment)
-    non_functional_compliance: LlmDimensionAssessment = Field(default_factory=LlmDimensionAssessment)
+    implementation_coverage: LlmDimensionAssessment = Field(default_factory=LlmDimensionAssessment)
     evidence_sufficiency: LlmDimensionAssessment = Field(default_factory=LlmDimensionAssessment)
 
 
@@ -187,6 +183,16 @@ class LlmItemAssessment(BaseModel):
     missing_evidence: List[str] = Field(default_factory=list)
     dimension_assessments: LlmDimensionAssessmentSet = Field(default_factory=LlmDimensionAssessmentSet)
     manual_review_needed: bool = True
+    merge_decision: str = ""
+    merge_reason: str = ""
+
+
+class LlmReviewRoundSummary(BaseModel):
+    round_name: str
+    status: Literal["success", "error", "skipped"]
+    summary: str = ""
+    error_message: str = ""
+    trigger_reasons: List[str] = Field(default_factory=list)
 
 
 class LlmReviewResult(BaseModel):
@@ -203,6 +209,12 @@ class LlmReviewResult(BaseModel):
     conflicts: List[str] = Field(default_factory=list)
     evidence_gaps: List[str] = Field(default_factory=list)
     used_graph_paths: List[LlmEvidencePath] = Field(default_factory=list)
+    review_strategy: str = ""
+    challenge_triggered: bool = False
+    challenge_reasons: List[str] = Field(default_factory=list)
+    merge_summary: str = ""
+    review_rounds: List[LlmReviewRoundSummary] = Field(default_factory=list)
+    request_previews: dict = Field(default_factory=dict)
     response_text: str = ""
     response_body: dict = Field(default_factory=dict)
     error_message: str = ""
