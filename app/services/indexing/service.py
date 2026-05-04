@@ -53,12 +53,17 @@ class OfflineIndexingService:
     def find_job_by_scope(self, repo_name: str, snapshot_ref: str) -> IndexJobDetail | None:
         if not repo_name or not snapshot_ref:
             return None
-        candidates = [
+        completed_jobs = [
             job for job in self._jobs.values()
             if job.get('repo_name') == repo_name
-            and (job.get('snapshot', {}).get('commit_hash') or job.get('snapshot', {}).get('branch')) == snapshot_ref
             and job.get('status') in {'completed', 'completed_with_warnings'}
         ]
+        candidates = [
+            job for job in completed_jobs
+            if (job.get('snapshot', {}).get('commit_hash') or job.get('snapshot', {}).get('branch')) == snapshot_ref
+        ]
+        if not candidates:
+            candidates = completed_jobs
         if not candidates:
             return None
         candidates.sort(key=lambda item: item.get('updated_at', ''), reverse=True)

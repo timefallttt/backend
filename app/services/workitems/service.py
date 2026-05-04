@@ -365,34 +365,62 @@ class WorkItemService:
             ],
         )
 
-    def _guess_seed_name(self, snippet: CandidateSnippet) -> str:
-        first_line = snippet.code.splitlines()[0].strip() if snippet.code else ''
-        named_function = self._extract_named_function_signature_name(first_line)
-        if named_function:
-            return named_function
-        patterns = [
+    def _guess_seed(self, snippet: CandidateSnippet) -> tuple[str, str]:
+        lines = [line.strip() for line in snippet.code.splitlines()[:30] if line.strip()] if snippet.code else []
+        class_patterns = [
+            r'^(?:export\s+)?(?:abstract\s+)?(?:class|struct|interface)\s+([A-Za-z_][A-Za-z0-9_]*)\b',
             r'^(?:export\s+)?class\s+([A-Za-z_][A-Za-z0-9_]*)\b',
         ]
-        for pattern in patterns:
-            match = re.search(pattern, first_line)
-            if match:
-                return match.group(1)
-        return ''
+        for line in lines:
+            if line.startswith('@'):
+                continue
+            named_function = self._extract_named_function_signature_name(line)
+            if named_function:
+                return named_function, 'function'
+        for line in lines:
+            if line.startswith('@'):
+                continue
+            for pattern in class_patterns:
+                match = re.search(pattern, line)
+                if match:
+                    return match.group(1), 'class'
+        return '', ''
+
+    def _guess_seed_name(self, snippet: CandidateSnippet) -> str:
+        return self._guess_seed(snippet)[0]
 
     def _build_seed_query(self, snippet: CandidateSnippet) -> GraphSeedQuery:
         seed_name = self._guess_seed_name(snippet)
         signature = snippet.code.splitlines()[0][:120] if snippet.code else ''
+        seed_path = self._normalize_seed_path(snippet.filename)
         return GraphSeedQuery(
-            path=snippet.filename if seed_name else '',
+            path=seed_path,
             name=seed_name,
             signature=signature if seed_name else '',
             max_matches=3,
         )
 
+    def _normalize_seed_path(self, path: str) -> str:
+        normalized = (path or '').replace('\\', '/')
+        for marker in ('/entry/', 'entry/'):
+            index = normalized.find(marker)
+            if index >= 0:
+                return normalized[index + (1 if marker.startswith('/') else 0):]
+        return normalized
+
     def _build_graph_seed_queries(self, snippets: List[CandidateSnippet]) -> List[GraphSeedQuery]:
         seeds: List[GraphSeedQuery] = []
         seen: set[tuple[str, str, str]] = set()
-        for snippet in snippets:
+
+        def snippet_priority(snippet: CandidateSnippet) -> int:
+            _, seed_kind = self._guess_seed(snippet)
+            if seed_kind == 'function':
+                return 0
+            if seed_kind == 'class':
+                return 1
+            return 2
+
+        for snippet in sorted(snippets, key=snippet_priority):
             primary = self._build_seed_query(snippet)
             self._append_seed_query(seeds, seen, primary)
             for call_seed in self._extract_call_seed_queries(snippet):
@@ -434,6 +462,8 @@ class WorkItemService:
         seen: set[tuple[str, str, str]],
         seed: GraphSeedQuery,
     ) -> None:
+        if not (seed.node_id or seed.name or seed.signature):
+            return
         key = (seed.name, seed.path, seed.signature)
         if key in seen or not any(key):
             return

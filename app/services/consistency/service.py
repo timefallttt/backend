@@ -810,26 +810,46 @@ class ConsistencyService:
         )
         primary_map = {item.item: item for item in primary.item_assessments}
         challenge_map = {item.item: item for item in challenge.item_assessments}
+        challenge_index_by_item = {
+            assessment.item: index
+            for index, assessment in enumerate(challenge.item_assessments)
+        }
+        used_challenge_indexes: set[int] = set()
 
         merged_items: List[LlmItemAssessment] = []
         conflicts = list(dict.fromkeys([*primary.conflicts, *challenge.conflicts]))
         missing_items = list(dict.fromkeys([*primary.missing_items, *challenge.missing_items]))
         evidence_gaps = list(dict.fromkeys([*primary.evidence_gaps, *challenge.evidence_gaps]))
 
-        for item in requirement_items:
+        for index, item in enumerate(requirement_items):
             base = primary_map.get(item) or self._build_error_assessment(item, '初审缺少该验收项结果。')
-            challenger = challenge_map.get(item) or self._build_error_assessment(item, '复核缺少该验收项结果。')
+            challenge_index = challenge_index_by_item.get(item)
+            if challenge_index is None and index < len(challenge.item_assessments) and index not in used_challenge_indexes:
+                challenge_index = index
+            if challenge_index is not None:
+                used_challenge_indexes.add(challenge_index)
+                challenger = challenge.item_assessments[challenge_index]
+            else:
+                challenger = self._build_error_assessment(item, '复核缺少该验收项结果。')
             if base.verdict != challenger.verdict:
                 conflicts.append(f'验收项《{item}》初审为 {base.verdict}，复核为 {challenger.verdict}。')
 
-            merged_dimension_assessments = self._merge_dimension_sets(
-                base.dimension_assessments,
-                challenger.dimension_assessments,
+            if challenger.verdict == 'error' and base.verdict != 'error':
+                chosen = base
+            elif base.verdict == 'error' and challenger.verdict != 'error':
+                chosen = challenger
+            else:
+                base_rank = self._verdict_rank(base.verdict)
+                challenger_rank = self._verdict_rank(challenger.verdict)
+                chosen = challenger if challenger_rank > base_rank else base
+            merged_dimension_assessments = (
+                chosen.dimension_assessments
+                if base.verdict == 'error' or challenger.verdict == 'error'
+                else self._merge_dimension_sets(
+                    base.dimension_assessments,
+                    challenger.dimension_assessments,
+                )
             )
-
-            base_rank = self._verdict_rank(base.verdict)
-            challenger_rank = self._verdict_rank(challenger.verdict)
-            chosen = challenger if challenger_rank > base_rank else base
             merge_decision, merge_reason = self._determine_item_merge_reason(
                 base,
                 challenger,
@@ -846,13 +866,18 @@ class ConsistencyService:
                 or base.verdict != challenger.verdict
                 or merged_confidence < 0.6
             )
-            merged_missing_evidence = list(dict.fromkeys([*base.missing_evidence, *challenger.missing_evidence]))
+            merged_missing_evidence = list(dict.fromkeys(
+                [
+                    *(base.missing_evidence if base.verdict != 'error' else []),
+                    *(challenger.missing_evidence if challenger.verdict != 'error' else []),
+                ]
+            ))
 
             merged_items.append(
                 LlmItemAssessment(
                     item=item,
                     verdict=chosen.verdict,
-                    score=min(base.score, challenger.score),
+                    score=chosen.score if base.verdict == 'error' or challenger.verdict == 'error' else min(base.score, challenger.score),
                     confidence=merged_confidence,
                     reasoning=self._combine_reasoning(base.reasoning, challenger.reasoning),
                     supporting_snippet_ids=list(dict.fromkeys([*base.supporting_snippet_ids, *challenger.supporting_snippet_ids])),
@@ -1388,6 +1413,7 @@ class ConsistencyService:
                 '你是需求实现审阅复核助手。请仅基于给定原始证据和提供的初审结果进行复核。'
                 '你的目标不是复述初审，而是主动寻找证据不足、过度推断、忽略约束、忽略异常分支和结论过宽的问题。'
                 '仍然必须返回完整 JSON 对象，字段必须齐全，不能省略任何字段。'
+                'item_assessments 必须与输入验收标准一一对应，数量、顺序和 item 原文都必须保持一致。'
             )
         else:
             system_message = (
@@ -1396,6 +1422,7 @@ class ConsistencyService:
                 '图路径证据通常用于补充调用关系、上下文和影响范围；'
                 '如果某些图路径与需求明显无关或只是通用日志/框架细节，你可以忽略它们。'
                 '你需要按固定维度审阅每条验收标准，并返回完整、字段齐全的 JSON 对象。'
+                'item_assessments 必须与输入验收标准一一对应，数量、顺序和 item 原文都必须保持一致。'
             )
         user_message = self._build_llm_user_message(
             evidence_pack,
@@ -1578,6 +1605,7 @@ class ConsistencyService:
         lines.append('请返回 JSON 对象，字段必须满足 output_contract。')
         lines.append('顶层字段必须完整包含：summary, overall_verdict, overall_score_raw, confidence, manual_review_needed, item_assessments, missing_items, conflicts, evidence_gaps。')
         lines.append('item_assessments 中每一项必须完整包含：item, verdict, score, confidence, reasoning, supporting_snippet_ids, supporting_path_ids, missing_evidence, dimension_assessments, manual_review_needed。')
+        lines.append('item_assessments 的数量和顺序必须与“二、验收标准”完全一致；每个 item 字段必须逐字复制对应验收标准原文，不得缩写、改写、合并、概括或替换同义词。')
         lines.append('overall_verdict 和 verdict 只允许使用：satisfied, partially_satisfied, not_satisfied。')
         lines.append('dimension_assessments 必须完整包含：implementation_coverage, evidence_sufficiency。')
         lines.append('每个维度对象必须完整包含：verdict, score, reasoning。')
